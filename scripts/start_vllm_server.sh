@@ -1,11 +1,14 @@
 export NCCL_P2P_LEVEL=NVL
 
-MODEL_PATH=""
+MODEL_PATH="models/navida_qwen2_5_vl"
+VLLM="/data1/conda_envs/embAI_sup/vllmwzy/bin/vllm"
+VLLM_GPU=${VLLM_GPU:-0}
+PORT=${PORT:-8201}
 
-CUDA_VISIBLE_DEVICES=3 vllm serve $MODEL_PATH --task generate \
-    --trust-remote-code  --limit-mm-per-prompt image=99999 \
-    --mm_processor_kwargs '{"max_pixels": 501760}' \
+CUDA_VISIBLE_DEVICES=$VLLM_GPU $VLLM serve "$MODEL_PATH" --runner generate \
+    --trust-remote-code --limit-mm-per-prompt '{"image": 99999}' \
+    --mm-processor-kwargs '{"max_pixels": 501760}' \
     --max-model-len 32768 --max-num-batched-tokens 65536 \
-    --port 8201 \
+    --port $PORT \
     --tensor-parallel-size 1 \
     --gpu-memory-utilization 0.9 \

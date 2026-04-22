@@ -4,6 +4,7 @@ from habitat import Env
 from habitat.core.agent import Agent
 from tqdm import trange
 import os, io
+import base64
 import re
 import torch
 import cv2
@@ -23,7 +24,12 @@ from PIL import Image
 from qwen_vl_utils import process_vision_info
 from collections import Counter
 from peft import PeftModel
-from vllm.multimodal.utils import encode_image_base64
+
+
+def encode_image_base64(image):
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 
@@ -151,7 +157,7 @@ class NaVIDA_Agent(Agent):
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
-        self.processor = AutoProcessor.from_pretrained(model_path)
+        self.processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
         self.processor.image_processor.max_pixels = 501760
         print("Initialization Complete")
 

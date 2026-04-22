@@ -2,7 +2,8 @@
 
 # sleep 7h
 
-MODEL_PATH=""
+MODEL_PATH="models/navida_qwen2_5_vl"
+PYTHON="/data1/conda_envs/embAI_sup/navida_wzy/bin/python"
 export PYTHONPATH=`pwd`:$PYTHONPATH
 
 #R2R
@@ -20,7 +21,7 @@ gpus=(2 2 3 3 4 4 5 5)
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     echo ${gpus[$IDX]}
-    CUDA_VISIBLE_DEVICES=${gpus[$IDX]} python src/eval/eval.py \
+    CUDA_VISIBLE_DEVICES=${gpus[$IDX]} $PYTHON src/eval/eval.py \
     --exp-config $CONFIG_PATH \
     --split-num $CHUNKS \
     --split-id $IDX \
@@ -36,6 +37,5 @@ done
 
 wait
 
-python src/eval/analyze_results.py \
+$PYTHON src/eval/analyze_results.py \
     --path $SAVE_PATH
-

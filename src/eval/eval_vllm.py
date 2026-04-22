@@ -4,13 +4,15 @@ from habitat import Env
 from habitat.core.agent import Agent
 from tqdm import trange
 import os
+import io
+import base64
 import re
 from tqdm import tqdm
 import cv2
 import imageio
 from habitat.utils.visualizations import maps
 import random
-from vllm import SamplingParams
+from types import SimpleNamespace
 import argparse, habitat
 from habitat_extensions import measures, task
 from habitat_baselines.config.default import get_config
@@ -24,7 +26,12 @@ from qwen_vl_utils import process_vision_info
 import multiprocessing as mp
 import time, math
 from openai import OpenAI
-from vllm.multimodal.utils import encode_image_base64
+
+
+def encode_image_base64(image):
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
 SYSTEM_PROMPT = "You are a helpful assistant."
@@ -81,6 +88,8 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
         continuse_rotation_count = 0
         last_dtg = 999
         if os.path.exists(os.path.join(os.path.join(result_path, "log"),"stats_{}.json".format(env.current_episode.episode_id))):
+            if result_queue is not None:
+                result_queue.put({"t_episode": 0, "skipped": 1})
             continue
         while not env.episode_over:
             
@@ -112,7 +121,8 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
             json.dump(result_dict, f, indent=4)
         
         t_dict["t_episode"] = time.time() - episode_start_time
-        result_queue.put(t_dict)
+        if result_queue is not None:
+            result_queue.put(t_dict)
 
 class NaVIDA_Agent(Agent):
     def __init__(self, api_key, base_url, result_path, forward_distance, 
@@ -137,10 +147,11 @@ class NaVIDA_Agent(Agent):
         )
         self.model = self.client.models.list().data[0].id
         
-        self.sampling_params = SamplingParams(
-            n = 1,
+        self.sampling_params = SimpleNamespace(
+            n=1,
             temperature=0.2,
             max_tokens=512, # i.e. max_completion_tokens
+            top_p=1.0,
         )
 
         self.promt_template = "Imagine you are a robot programmed for navigation tasks. "\
@@ -373,6 +384,7 @@ def main():
 
     parser.add_argument("--exp-config",type=str,required=True,help="path to config yaml containing info about experiment")
     parser.add_argument("--split-num",type=int,required=True,help="chunks of evluation")
+    parser.add_argument("--split-id",type=int,default=None,help="optional split ID; when set, run only this split in the current process")
     parser.add_argument("--resolution-ratio",type=float,help="location of model weights",default=0.5)
     parser.add_argument("--result-path",type=str,required=True,help="location to save results")
     parser.add_argument("--forward-distance",type=int,help="distance that one forward action takes",default=25)
@@ -411,6 +423,12 @@ def main():
             
     dataset = habitat.datasets.make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
     dataset_splits = dataset.get_splits(args.split_num, allow_uneven_splits=True)
+
+    if args.split_id is not None:
+        evaluate_agent(None, api_key, base_url, config, dataset_splits[args.split_id], args.result_path,
+                args.num_generations, args.forward_distance, args.turn_angle,
+                args.max_action_history, args.resolution_ratio)
+        return
 
     num_episodes = len(dataset.episodes) 
 
