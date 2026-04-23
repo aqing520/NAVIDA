@@ -5,14 +5,15 @@ export PYTHONPATH=`pwd`:$PYTHONPATH
 
 #R2R
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="eval_log/navida_r2r_vllm_official_gpu0"
+PROMPT_STYLE="baseline" # baseline, stop_hint, or sr_stop
+SAVE_PATH="eval_log/navida_r2r_vllm_official_gpu0_${PROMPT_STYLE}"
 
 #RxR
 # CONFIG_PATH="config/vln_rxr.yaml"
 # SAVE_PATH="eval_log/navida_rxr" 
 
-CHUNKS=4 # number of Habitat workers / dataset splits
-gpus=(0 0 0 0)
+CHUNKS=8 # number of Habitat workers / dataset splits
+gpus=(2 2 5 5 6 6 0 0)
 
 export OPENAI_API_KEY="EMPTY"
 export OPENAI_API_BASE="http://127.0.0.1:8201/v1"
@@ -34,6 +35,7 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
     --resolution-ratio 0.5 \
     --max-action-history 200 \
     --num-generations 1 \
+    --prompt-style $PROMPT_STYLE \
     --result-path $SAVE_PATH &
 done
 

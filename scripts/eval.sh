@@ -8,7 +8,8 @@ export PYTHONPATH=`pwd`:$PYTHONPATH
 
 #R2R
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="eval_log/navida_r2r"
+PROMPT_STYLE="baseline" # baseline, stop_hint, or sr_stop
+SAVE_PATH="eval_log/navida_r2r_${PROMPT_STYLE}"
 
 
 #RxR
@@ -31,6 +32,7 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
     --max-action-history 200 \
     --model-path $MODEL_PATH \
     --num-generations 1 \
+    --prompt-style $PROMPT_STYLE \
     --result-path $SAVE_PATH &
     
 done

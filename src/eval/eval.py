@@ -33,6 +33,31 @@ def encode_image_base64(image):
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 
+BASE_PROMPT_TEMPLATE = "Imagine you are a robot programmed for navigation tasks. "\
+    "You have been given a video of historical observations and an image of the current observation. "\
+    "Your assigned task is: '{}'. Analyze this series of images to decide your next move, "\
+    "which could involve turning left or right by a specific degree or moving forward a certain distance."
+
+STOP_HINT_PROMPT_TEMPLATE = BASE_PROMPT_TEMPLATE + " You may answer stop when the goal has been reached."
+
+SR_STOP_PROMPT_TEMPLATE = "Imagine you are a robot programmed for navigation tasks. "\
+    "You have been given a video of historical observations and an image of the current observation. "\
+    "Your assigned task is: '{}'. Analyze this series of images to decide your next move. "\
+    "Available actions are: stop; move forward by a distance in cm; turn left by degrees; turn right by degrees. "\
+    "If the current view already satisfies the destination description or reaches the final landmark, choose stop instead of moving on. "\
+    "Otherwise choose the safest next one or two actions that continue following the instruction. "\
+    "Respond only with comma-separated actions in these formats: stop, forward <number> cm, turn left <number> degree, turn right <number> degree."
+
+
+def get_prompt_template(prompt_style):
+    if prompt_style == "baseline":
+        return BASE_PROMPT_TEMPLATE
+    if prompt_style == "stop_hint":
+        return STOP_HINT_PROMPT_TEMPLATE
+    if prompt_style == "sr_stop":
+        return SR_STOP_PROMPT_TEMPLATE
+    raise ValueError(f"Unsupported prompt style: {prompt_style}")
+
 
 def action_id_to_str(action_id):
     # id: 0-stop, 1 move forward, 2 turn left, 3 turn right
@@ -64,7 +89,8 @@ def str2bool(v):
 
 
 def evaluate_agent(config, split_id, dataset, model_path, lora_path, result_path, num_generations,
-                    forward_distance, turn_angle, max_action_history, resolution_ratio) -> None:
+                    forward_distance, turn_angle, max_action_history, resolution_ratio, prompt_style,
+                    temperature, max_episodes) -> None:
  
     env = Env(config.habitat, dataset)
 
@@ -75,9 +101,13 @@ def evaluate_agent(config, split_id, dataset, model_path, lora_path, result_path
                         turn_angle, 
                         max_action_history, 
                         resolution_ratio, 
-                        num_generations)
+                        num_generations,
+                        prompt_style,
+                        temperature)
 
     num_episodes = len(env.episodes)
+    if max_episodes is not None:
+        num_episodes = min(num_episodes, max_episodes)
     
     EARLY_STOP_ROTATION = 25
     EARLY_STOP_STEPS = 400
@@ -125,7 +155,8 @@ def evaluate_agent(config, split_id, dataset, model_path, lora_path, result_path
 
 class NaVIDA_Agent(Agent):
     def __init__(self, model_path, lora_path, result_path, forward_distance, 
-                    turn_angle, max_action_history, resolution_ratio, num_generations = 1, require_map=True):
+                    turn_angle, max_action_history, resolution_ratio, num_generations = 1,
+                    prompt_style="baseline", temperature=0.2, require_map=True):
         
         print("Initialize NaVIDA")
         
@@ -161,14 +192,11 @@ class NaVIDA_Agent(Agent):
         self.processor.image_processor.max_pixels = 501760
         print("Initialization Complete")
 
-        self.promt_template = "Imagine you are a robot programmed for navigation tasks. "\
-            "You have been given a video of historical observations and an image of the current observation. "\
-            "Your assigned task is: '{}'. Analyze this series of images to decide your next move, "\
-            "which could involve turning left or right by a specific degree or moving forward a certain distance."
+        self.promt_template = get_prompt_template(prompt_style)
         
         self.generation_config = GenerationConfig(
             do_sample=True,
-            temperature=0.2,
+            temperature=temperature,
             max_new_tokens=512,
             top_p=1.0,
             use_cache=True,
@@ -226,7 +254,9 @@ class NaVIDA_Agent(Agent):
         return outputs_text
 
     def extract_multi_result(self, output):
-        sub_actions = output.split(', ')
+        sub_actions = [item for item in re.split(r'\s*,\s*', output.strip()) if item]
+        if len(sub_actions) == 0:
+            sub_actions = [output]
         result = []
         for sub_action in sub_actions:
             action_index, numeric = self.extract_result(sub_action)
@@ -429,6 +459,12 @@ def main():
     parser.add_argument("--turn-angle",type=int,help="angle that one turn action takes",default=15)
     parser.add_argument("--max-action-history",type=int,help="the maximum num of action history",default=10)
     parser.add_argument("--num-generations",type=int,help="whether use video or multi image",default=1)
+    parser.add_argument("--prompt-style", choices=["baseline", "stop_hint", "sr_stop"], default="baseline",
+                        help="prompt template used for navigation decisions")
+    parser.add_argument("--temperature", type=float, default=0.2,
+                        help="sampling temperature for local generation")
+    parser.add_argument("--max-episodes", type=int, default=None,
+                        help="optional maximum number of episodes to evaluate in this split")
     args = parser.parse_args()
 
     config = get_config(args.exp_config)
@@ -461,7 +497,7 @@ def main():
 
     evaluate_agent(config, args.split_id, dataset_split, args.model_path, args.lora_path, args.result_path,
                 args.num_generations, args.forward_distance, args.turn_angle, args.max_action_history,
-                args.resolution_ratio)
+                args.resolution_ratio, args.prompt_style, args.temperature, args.max_episodes)
 
 if __name__ == "__main__":
     main()

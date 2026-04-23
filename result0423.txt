@@ -1,0 +1,316 @@
+====================================
+0423 实验总结
+
+今天完成了三类实验：
+1. baseline 复现；
+2. 提示词实验：sr_stop、stop_hint；
+3. 温度实验：baseline + temperature=0.0 / 0.1。
+
+今日最优结果：
+eval_log/navida_r2r_vllm_baseline_t0p1_full16
+Success rate: 1106/1839 (0.601)
+Oracle success rate: 1249/1839 (0.679)
+SPL: 983.925/1839 (0.535)
+Distance to goal: 4.471
+Path length: 10.572
+
+结论：今天最有效的改动是保留 baseline 提示词，将 temperature 从 0.2 调到 0.1。
+====================================
+
+
+
+==================================
+官方论文结果：
+
+Success rate: 61.4
+Oracle success rate: 69.5
+SPL: 54.7
+Distance to goal: 4.32
+==================================
+
+
+
+====================================
+0423 官方qwen 2.5 vl  复现
+eval_log/navida_r2r_vllm_official_gpu0
+
+Success rate: 1078/1839 (0.586)
+Oracle success rate: 1228/1839 (0.668)
+SPL: 965.167/1839 (0.525)
+Distance to goal: 4.683
+Path length: 10.425
+ndtw: 0.000
+=====================================
+
+
+
+====================================
+0423 官方qwen 2.5 vl  sr_stop提示词实验（partial，已停止）
+eval_log/navida_r2r_vllm_official_gpu0_sr_stop
+
+Success rate: 128/363 (0.353)
+Oracle success rate: 243/363 (0.669)
+SPL: 102.240/363 (0.282)
+Distance to goal: 7.244
+Path length: 14.939
+ndtw: 0.000
+
+同ID baseline对比（363个episode）：
+Success rate: 215/363 (0.592)
+Oracle success rate: 247/363 (0.680)
+SPL: 192.487/363 (0.530)
+Distance to goal: 4.558
+Path length: 10.802
+
+结论：sr_stop提示词明显退化，已停止，不作为有效复现结果。
+=====================================
+
+
+
+====================================
+0423 20:28 SR提升循环实验：baseline_t0p0_pilot（pilot）
+eval_log/navida_r2r_vllm_baseline_t0p0_pilot12x20
+
+评测环境 Python: /data1/conda_envs/embAI_sup/navida_wzy/bin/python
+vLLM 服务 Python: /data1/conda_envs/embAI_sup/vllmwzy/bin/python
+vLLM 服务: GPU 3, port 8201, gpu_memory_utilization=0.9
+Worker: 12
+Worker GPUs: 5 5 5 5 6 6 6 6 0 0 0 0
+Prompt style: baseline
+Temperature: 0.0
+Max episodes per split: 20
+
+当前实验结果：
+Success rate: 148/240 (0.617)
+Oracle success rate: 170/240 (0.708)
+SPL: 130.276/240 (0.543)
+Distance to goal: 4.514
+Path length: 10.394
+ndtw: 0.000
+oracle_success=1, success=0: 22/240
+
+同ID baseline对比：
+eval_log/navida_r2r_vllm_official_gpu0
+Baseline同ID结果：
+Success rate: 138/240 (0.575)
+Oracle success rate: 159/240 (0.662)
+SPL: 122.180/240 (0.509)
+Distance to goal: 4.907
+Path length: 10.975
+ndtw: 0.000
+oracle_success=1, success=0: 21/240
+
+差值（当前 - baseline）：
+SR: +0.042
+OSR: +0.046
+SPL: +0.034
+Distance to goal: -0.393
+Path length: -0.581
+oracle-only: +1
+
+Success翻转：
+new success / baseline fail: 33
+new fail / baseline success: 23
+
+分析结论：SR高于同ID baseline，且SPL/Path/OSR没有明显退化，建议进入更大pilot或全量。
+下一步决策：promote
+=====================================
+
+
+
+====================================
+0423 实验总结
+
+今天完成了三类实验：
+1. baseline 复现；
+2. 提示词实验：sr_stop、stop_hint；
+3. 温度实验：baseline + temperature=0.0 / 0.1。
+
+今日最优结果：
+eval_log/navida_r2r_vllm_baseline_t0p1_full16
+Success rate: 1106/1839 (0.601)
+Oracle success rate: 1249/1839 (0.679)
+SPL: 983.925/1839 (0.535)
+Distance to goal: 4.471
+Path length: 10.572
+
+结论：今天最有效的改动是保留 baseline 提示词，将 temperature 从 0.2 调到 0.1。
+=====================================
+
+
+
+====================================
+0423 实验总结
+
+今天完成了三类实验：
+1. baseline 复现；
+2. 提示词实验：sr_stop、stop_hint；
+3. 温度实验：baseline + temperature=0.0 / 0.1。
+
+今日最优结果：
+eval_log/navida_r2r_vllm_baseline_t0p1_full16
+Success rate: 1106/1839 (0.601)
+Oracle success rate: 1249/1839 (0.679)
+SPL: 983.925/1839 (0.535)
+Distance to goal: 4.471
+Path length: 10.572
+
+结论：今天最有效的改动是保留 baseline 提示词，将 temperature 从 0.2 调到 0.1。
+=====================================
+
+
+
+====================================
+0423 20:47 SR提升循环实验：baseline_t0p1_pilot（pilot）
+eval_log/navida_r2r_vllm_baseline_t0p1_pilot12x20
+
+评测环境 Python: /data1/conda_envs/embAI_sup/navida_wzy/bin/python
+vLLM 服务 Python: /data1/conda_envs/embAI_sup/vllmwzy/bin/python
+vLLM 服务: GPU 3, port 8201, gpu_memory_utilization=0.9
+Worker: 12
+Worker GPUs: 5 5 5 5 6 6 6 6 0 0 0 0
+Prompt style: baseline
+Temperature: 0.1
+Max episodes per split: 20
+
+当前实验结果：
+Success rate: 153/240 (0.637)
+Oracle success rate: 170/240 (0.708)
+SPL: 133.911/240 (0.558)
+Distance to goal: 4.484
+Path length: 10.880
+ndtw: 0.000
+oracle_success=1, success=0: 17/240
+
+同ID baseline对比：
+eval_log/navida_r2r_vllm_official_gpu0
+Baseline同ID结果：
+Success rate: 138/240 (0.575)
+Oracle success rate: 159/240 (0.662)
+SPL: 122.180/240 (0.509)
+Distance to goal: 4.907
+Path length: 10.975
+ndtw: 0.000
+oracle_success=1, success=0: 21/240
+
+差值（当前 - baseline）：
+SR: +0.062
+OSR: +0.046
+SPL: +0.049
+Distance to goal: -0.423
+Path length: -0.095
+oracle-only: -4
+
+Success翻转：
+new success / baseline fail: 36
+new fail / baseline success: 21
+
+分析结论：SR高于同ID baseline，且SPL/Path/OSR没有明显退化，建议进入更大pilot或全量。
+下一步决策：promote
+=====================================
+
+
+
+====================================
+0423 21:07 SR提升循环实验：stop_hint_t0p2_pilot（pilot）
+eval_log/navida_r2r_vllm_stop_hint_t0p2_pilot12x20
+
+评测环境 Python: /data1/conda_envs/embAI_sup/navida_wzy/bin/python
+vLLM 服务 Python: /data1/conda_envs/embAI_sup/vllmwzy/bin/python
+vLLM 服务: GPU 3, port 8201, gpu_memory_utilization=0.9
+Worker: 12
+Worker GPUs: 5 5 5 5 6 6 6 6 0 0 0 0
+Prompt style: stop_hint
+Temperature: 0.2
+Max episodes per split: 20
+
+当前实验结果：
+Success rate: 136/240 (0.567)
+Oracle success rate: 164/240 (0.683)
+SPL: 119.988/240 (0.500)
+Distance to goal: 5.303
+Path length: 11.362
+ndtw: 0.000
+oracle_success=1, success=0: 28/240
+
+同ID baseline对比：
+eval_log/navida_r2r_vllm_official_gpu0
+Baseline同ID结果：
+Success rate: 138/240 (0.575)
+Oracle success rate: 159/240 (0.662)
+SPL: 122.180/240 (0.509)
+Distance to goal: 4.907
+Path length: 10.975
+ndtw: 0.000
+oracle_success=1, success=0: 21/240
+
+差值（当前 - baseline）：
+SR: -0.008
+OSR: +0.021
+SPL: -0.009
+Distance to goal: +0.396
+Path length: +0.387
+oracle-only: +7
+
+Success翻转：
+new success / baseline fail: 29
+new fail / baseline success: 31
+
+分析结论：OSR基本不变但SR下降，oracle-only增加，说明stop/final action问题变严重。
+下一步决策：stop
+=====================================
+
+
+
+====================================
+0423 23:22 SR提升循环实验：baseline_t0p1_full（full）
+eval_log/navida_r2r_vllm_baseline_t0p1_full16
+
+评测环境 Python: /data1/conda_envs/embAI_sup/navida_wzy/bin/python
+vLLM 服务 Python: /data1/conda_envs/embAI_sup/vllmwzy/bin/python
+vLLM 服务: GPU 3, port 8201, gpu_memory_utilization=0.9
+Worker: 12
+Worker GPUs: 5 5 5 5 6 6 6 6 0 0 0 0
+Prompt style: baseline
+Temperature: 0.1
+Max episodes per split: none
+
+当前实验结果：
+Success rate: 1106/1839 (0.601)
+Oracle success rate: 1249/1839 (0.679)
+SPL: 983.925/1839 (0.535)
+Distance to goal: 4.471
+Path length: 10.572
+ndtw: 0.000
+oracle_success=1, success=0: 143/1839
+
+同ID baseline对比：
+eval_log/navida_r2r_vllm_official_gpu0
+Baseline同ID结果：
+Success rate: 1078/1839 (0.586)
+Oracle success rate: 1228/1839 (0.668)
+SPL: 965.167/1839 (0.525)
+Distance to goal: 4.683
+Path length: 10.425
+ndtw: 0.000
+oracle_success=1, success=0: 150/1839
+
+差值（当前 - baseline）：
+SR: +0.015
+OSR: +0.011
+SPL: +0.010
+Distance to goal: -0.212
+Path length: +0.147
+oracle-only: -7
+
+Success翻转：
+new success / baseline fail: 203
+new fail / baseline success: 175
+
+分析结论：SR高于同ID baseline，且SPL/Path/OSR没有明显退化，建议进入更大pilot或全量。
+下一步决策：promote
+=====================================
+
+
+
+
