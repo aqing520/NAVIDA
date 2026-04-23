@@ -5,17 +5,23 @@ export PYTHONPATH=`pwd`:$PYTHONPATH
 
 #R2R
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="eval_log/navida_r2r_vllm"
+SAVE_PATH="eval_log/navida_r2r_vllm_official_gpu0"
 
 #RxR
 # CONFIG_PATH="config/vln_rxr.yaml"
 # SAVE_PATH="eval_log/navida_rxr" 
 
 CHUNKS=4 # number of Habitat workers / dataset splits
-gpus=(2 4 6 7)
+gpus=(0 0 0 0)
 
 export OPENAI_API_KEY="EMPTY"
 export OPENAI_API_BASE="http://127.0.0.1:8201/v1"
+export NO_PROXY="127.0.0.1,localhost"
+export no_proxy="127.0.0.1,localhost"
+unset http_proxy
+unset https_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     echo "Launching Habitat worker $IDX on GPU ${gpus[$IDX]}"
