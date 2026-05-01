@@ -35,6 +35,10 @@ def encode_image_base64(image):
 
 
 SYSTEM_PROMPT = "You are a helpful assistant."
+STOP_CONFIRM_PROMPT = (
+    "Re-evaluate the current observation and instruction carefully. "
+    "Respond with the same action format as before."
+)
 
 BASE_PROMPT_TEMPLATE = "Imagine you are a robot programmed for navigation tasks. "\
     "You have been given a video of historical observations and an image of the current observation. "\
@@ -75,10 +79,27 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
+def episode_scene_name(scene_id):
+    return os.path.splitext(os.path.basename(scene_id))[0]
+
+
+def observations_instruction_text(observations):
+    if "instruction" not in observations:
+        return ""
+    instruction = observations["instruction"]
+    if isinstance(instruction, dict):
+        return instruction.get("text", "")
+    return ""
+
 def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path, num_generations,
                     forward_distance, turn_angle, max_action_history, resolution_ratio, prompt_style,
                     temperature, max_episodes) -> None:
- 
+    if len(dataset.episodes) == 0:
+        if result_queue is not None:
+            result_queue.put({"t_episode": 0, "empty_split": 1})
+        return
+
     env = Env(config.habitat, dataset)
 
     agent = NaVIDA_Agent(
@@ -133,9 +154,25 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
             
             
             action = agent.act(obs, info, env.current_episode.episode_id)
-
-            if continuse_rotation_count > EARLY_STOP_ROTATION or iter_step>EARLY_STOP_STEPS:
+            forced_stop_reason = None
+            if continuse_rotation_count > EARLY_STOP_ROTATION:
                 action = {"action": 0}
+                forced_stop_reason = "rotation_stall"
+            elif iter_step > EARLY_STOP_STEPS:
+                action = {"action": 0}
+                forced_stop_reason = "step_limit"
+
+            agent.log_execution_trace(
+                episode_id=env.current_episode.episode_id,
+                instruction_text=observations_instruction_text(obs),
+                iter_step=iter_step,
+                distance_to_goal=info.get("distance_to_goal"),
+                success=info.get("success"),
+                oracle_success=info.get("oracle_success"),
+                continuse_rotation_count=continuse_rotation_count,
+                executed_action=action["action"],
+                forced_stop_reason=forced_stop_reason,
+            )
 
             
             iter_step+=1
@@ -171,6 +208,7 @@ class NaVIDA_Agent(Agent):
         os.makedirs(self.result_path, exist_ok=True)
         os.makedirs(os.path.join(self.result_path, "log"), exist_ok=True)
         os.makedirs(os.path.join(self.result_path, "video"), exist_ok=True)
+        os.makedirs(os.path.join(self.result_path, "trace"), exist_ok=True)
 
         self.client = OpenAI(
             api_key=api_key,
@@ -206,10 +244,9 @@ class NaVIDA_Agent(Agent):
         return [data[i] for i in indices]
 
 
-    def predict_inference(self):
-
+    def predict_inference(self, messages=None):
         outputs = self.client.chat.completions.create(
-            messages=self.conversations,
+            messages=self.conversations if messages is None else messages,
             model=self.model,
             max_completion_tokens=self.sampling_params.max_tokens,
             temperature=self.sampling_params.temperature,
@@ -219,6 +256,22 @@ class NaVIDA_Agent(Agent):
         output_text = output_text.strip()
         
         return output_text
+
+    def confirm_stop(self, navigation):
+        confirm_messages = list(self.conversations)
+        confirm_messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": navigation}],
+        })
+        confirm_messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": STOP_CONFIRM_PROMPT}],
+        })
+        output_text = self.predict_inference(confirm_messages).strip()
+        confirm_result = self.extract_multi_result(output_text)
+        confirm_first_action = confirm_result[0][0] if len(confirm_result) > 0 else None
+        keep_stop = confirm_first_action == 0
+        return output_text, keep_stop, confirm_result
 
     def extract_multi_result(self, output):
         sub_actions = [item for item in re.split(r'\s*,\s*', output.strip()) if item]
@@ -326,6 +379,36 @@ class NaVIDA_Agent(Agent):
         self.conversations.append({
             "role": "system",
             "content": [{"type": "text", "text": SYSTEM_PROMPT}]})
+        self.step_id = 0
+        self.last_action_meta = {
+            "decision_source": "reset",
+            "raw_output": None,
+            "selected_action": None,
+            "parsed_action_ids": [],
+            "pending_length_after": 0,
+        }
+
+    def log_execution_trace(self, episode_id, instruction_text, iter_step, distance_to_goal,
+                            success, oracle_success, continuse_rotation_count,
+                            executed_action, forced_stop_reason):
+        trace_path = os.path.join(self.result_path, "trace", f"trace_{episode_id}.jsonl")
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        meta = dict(self.last_action_meta)
+        record = {
+            "episode_id": int(episode_id),
+            "trace_step": int(self.step_id),
+            "iter_step": int(iter_step),
+            "distance_to_goal": float(distance_to_goal) if distance_to_goal is not None else None,
+            "success": int(success) if success is not None else None,
+            "oracle_success": int(oracle_success) if oracle_success is not None else None,
+            "continuse_rotation_count": int(continuse_rotation_count),
+            "decision_source": meta.get("decision_source"),
+            "raw_output": meta.get("raw_output"),
+            "parsed_action_ids": meta.get("parsed_action_ids"),
+            "pending_length_after_decision": meta.get("pending_length_after"),
+        }
+        with open(trace_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
         
     def act(self, observations, info, episode_id):
 
@@ -346,10 +429,31 @@ class NaVIDA_Agent(Agent):
 
         if len(self.pending_action_list) != 0 :
             temp_action = self.pending_action_list.pop(0)
+
+            if temp_action == 0:
+                stop_confirm_response, stop_confirm_keep_stop, confirm_result = self.confirm_stop("stop")
+                if not stop_confirm_keep_stop:
+                    replacement_action = None
+                    for candidate_action_index, candidate_numeric in confirm_result:
+                        if candidate_action_index is not None and candidate_action_index != 0:
+                            replacement_action = candidate_action_index
+                            break
+                    if replacement_action is None:
+                        replacement_action = random.randint(1, 3)
+                    temp_action = replacement_action
+
+            self.last_action_meta = {
+                "decision_source": "pending_action",
+                "raw_output": None,
+                "selected_action": temp_action,
+                "parsed_action_ids": [],
+                "pending_length_after": len(self.pending_action_list),
+            }
             
             if self.require_map:
                 img = self.addtext(output_im, observations["instruction"]["text"], "Pending action: {}".format(temp_action))
                 self.topdown_map_list.append(img)
+            self.step_id += 1
             return {"action": temp_action}
 
         # for observation1+observation2 action style
@@ -379,11 +483,39 @@ class NaVIDA_Agent(Agent):
             self.topdown_map_list.append(img)
         
         result = self.extract_multi_result(navigation)
+        parsed_action_ids = []
+        random_fallback = False
+        stop_confirm_response = None
+        stop_confirm_keep_stop = None
 
         select_action_idx = 2
 
-        result = result[:select_action_idx]
+        execution_result = result[:select_action_idx]
+        if execution_result and execution_result[0][0] == 0:
+            stop_confirm_response, stop_confirm_keep_stop, confirm_result = self.confirm_stop(navigation)
+            if not stop_confirm_keep_stop:
+                replacement = None
+                for candidate_action_index, candidate_numeric in confirm_result:
+                    if candidate_action_index is not None and candidate_action_index != 0:
+                        replacement = (candidate_action_index, candidate_numeric)
+                        break
+                if replacement is None:
+                    for candidate_action_index, candidate_numeric in result[1:]:
+                        if candidate_action_index is not None and candidate_action_index != 0:
+                            replacement = (candidate_action_index, candidate_numeric)
+                            break
+                if replacement is not None:
+                    execution_result = [replacement]
+                else:
+                    fallback_action = random.randint(1, 3)
+                    fallback_numeric = self.forward_distance if fallback_action == 1 else self.turn_angle
+                    execution_result = [(fallback_action, fallback_numeric)]
+                    random_fallback = True
+
         for action_index,numeric in result:
+            parsed_action_ids.append(action_index)
+
+        for action_index,numeric in execution_result:
 
             if action_index == 0:
                 self.pending_action_list.append(0)
@@ -404,8 +536,25 @@ class NaVIDA_Agent(Agent):
                 action_index = random.randint(1, 3)
                 navigation = self.action_id_to_str(action_index)
                 self.pending_action_list.append(action_index)
+                random_fallback = True
 
-        return {"action": self.pending_action_list.pop(0)}
+        if len(self.pending_action_list) == 0:
+            print('random select an action')
+            action_index = random.randint(1, 3)
+            navigation = self.action_id_to_str(action_index)
+            self.pending_action_list.append(action_index)
+            random_fallback = True
+
+        selected_action = self.pending_action_list.pop(0)
+        self.last_action_meta = {
+            "decision_source": "model_output",
+            "raw_output": navigation,
+            "selected_action": selected_action,
+            "parsed_action_ids": parsed_action_ids,
+            "pending_length_after": len(self.pending_action_list),
+        }
+        self.step_id += 1
+        return {"action": selected_action}
 
 
 def main():
@@ -427,6 +576,8 @@ def main():
                         help="sampling temperature for vLLM chat completions")
     parser.add_argument("--max-episodes", type=int, default=None,
                         help="optional maximum number of episodes to evaluate in each split")
+    parser.add_argument("--scene-id", type=str, default=None,
+                        help="optional scene name filter, e.g. QUCTc6BB5sX")
     args = parser.parse_args()
 
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -457,7 +608,15 @@ def main():
             }
         )
             
-    dataset = habitat.datasets.make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
+    if args.scene_id is not None:
+        dataset = habitat.datasets.make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
+        dataset.episodes = [
+            ep for ep in dataset.episodes
+            if episode_scene_name(ep.scene_id) == args.scene_id
+        ]
+    else:
+        dataset = habitat.datasets.make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
+
     dataset_splits = dataset.get_splits(args.split_num, allow_uneven_splits=True)
 
     if args.split_id is not None:

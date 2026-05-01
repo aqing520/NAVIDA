@@ -3,3 +3,4 @@ models/*
 eval_log/*
 __pycache__/
 *.pyc
+logs/

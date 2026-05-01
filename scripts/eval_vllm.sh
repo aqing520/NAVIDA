@@ -1,6 +1,6 @@
 #!/bin/bash
 
-PYTHON="/data1/conda_envs/embAI_sup/navida_wzy/bin/python"
+PYTHON="/data1/conda_envs/embAI_sup/awzy/navida_wzy/bin/python"
 export PYTHONPATH=`pwd`:$PYTHONPATH
 
 #R2R
