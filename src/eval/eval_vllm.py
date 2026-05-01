@@ -311,6 +311,17 @@ class NaVIDA_Agent(Agent):
             match = match.group()
             return 3, float(match)
         return None, None
+
+    def expand_action_repeats(self, action_index, numeric):
+        if action_index == 1:
+            return min(3, round(numeric / self.forward_distance))
+        if action_index in (2, 3):
+            repeats = min(3, round(numeric / self.turn_angle))
+            # Keep 45-degree turns from expanding into three blind rotations.
+            if numeric is not None and numeric >= 45:
+                repeats = min(repeats, 2)
+            return repeats
+        return 0
     
 
     def addtext(self, image, instuction, navigation):
@@ -429,19 +440,6 @@ class NaVIDA_Agent(Agent):
 
         if len(self.pending_action_list) != 0 :
             temp_action = self.pending_action_list.pop(0)
-
-            if temp_action == 0:
-                stop_confirm_response, stop_confirm_keep_stop, confirm_result = self.confirm_stop("stop")
-                if not stop_confirm_keep_stop:
-                    replacement_action = None
-                    for candidate_action_index, candidate_numeric in confirm_result:
-                        if candidate_action_index is not None and candidate_action_index != 0:
-                            replacement_action = candidate_action_index
-                            break
-                    if replacement_action is None:
-                        replacement_action = random.randint(1, 3)
-                    temp_action = replacement_action
-
             self.last_action_meta = {
                 "decision_source": "pending_action",
                 "raw_output": None,
@@ -484,33 +482,10 @@ class NaVIDA_Agent(Agent):
         
         result = self.extract_multi_result(navigation)
         parsed_action_ids = []
-        random_fallback = False
-        stop_confirm_response = None
-        stop_confirm_keep_stop = None
 
         select_action_idx = 2
 
         execution_result = result[:select_action_idx]
-        if execution_result and execution_result[0][0] == 0:
-            stop_confirm_response, stop_confirm_keep_stop, confirm_result = self.confirm_stop(navigation)
-            if not stop_confirm_keep_stop:
-                replacement = None
-                for candidate_action_index, candidate_numeric in confirm_result:
-                    if candidate_action_index is not None and candidate_action_index != 0:
-                        replacement = (candidate_action_index, candidate_numeric)
-                        break
-                if replacement is None:
-                    for candidate_action_index, candidate_numeric in result[1:]:
-                        if candidate_action_index is not None and candidate_action_index != 0:
-                            replacement = (candidate_action_index, candidate_numeric)
-                            break
-                if replacement is not None:
-                    execution_result = [replacement]
-                else:
-                    fallback_action = random.randint(1, 3)
-                    fallback_numeric = self.forward_distance if fallback_action == 1 else self.turn_angle
-                    execution_result = [(fallback_action, fallback_numeric)]
-                    random_fallback = True
 
         for action_index,numeric in result:
             parsed_action_ids.append(action_index)
@@ -520,15 +495,15 @@ class NaVIDA_Agent(Agent):
             if action_index == 0:
                 self.pending_action_list.append(0)
             elif action_index == 1:
-                for _ in range(min(3, round(numeric/self.forward_distance))):
+                for _ in range(self.expand_action_repeats(action_index, numeric)):
                     self.pending_action_list.append(1)
 
             elif action_index == 2:
-                for _ in range(min(3,round(numeric/self.turn_angle))):
+                for _ in range(self.expand_action_repeats(action_index, numeric)):
                     self.pending_action_list.append(2)
 
             elif action_index == 3:
-                for _ in range(min(3,round(numeric/self.turn_angle))):
+                for _ in range(self.expand_action_repeats(action_index, numeric)):
                     self.pending_action_list.append(3)
             
             if action_index is None or len(self.pending_action_list)==0:
@@ -536,14 +511,12 @@ class NaVIDA_Agent(Agent):
                 action_index = random.randint(1, 3)
                 navigation = self.action_id_to_str(action_index)
                 self.pending_action_list.append(action_index)
-                random_fallback = True
 
         if len(self.pending_action_list) == 0:
             print('random select an action')
             action_index = random.randint(1, 3)
             navigation = self.action_id_to_str(action_index)
             self.pending_action_list.append(action_index)
-            random_fallback = True
 
         selected_action = self.pending_action_list.pop(0)
         self.last_action_meta = {
