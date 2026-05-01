@@ -39,6 +39,8 @@ STOP_CONFIRM_PROMPT = (
     "Re-evaluate the current observation and instruction carefully. "
     "Respond with the same action format as before."
 )
+OPENING_VOTE_STEPS = 5
+OPENING_VOTE_K = 5
 
 BASE_PROMPT_TEMPLATE = "Imagine you are a robot programmed for navigation tasks. "\
     "You have been given a video of historical observations and an image of the current observation. "\
@@ -257,6 +259,28 @@ class NaVIDA_Agent(Agent):
         
         return output_text
 
+    def sample_opening_vote(self):
+        samples = []
+        counts = {}
+
+        for _ in range(OPENING_VOTE_K):
+            output_text = self.predict_inference()
+            result = self.extract_multi_result(output_text)
+            first_action = result[0][0] if len(result) > 0 else None
+            samples.append((output_text, first_action))
+            if first_action is not None:
+                counts[first_action] = counts.get(first_action, 0) + 1
+
+        if not counts:
+            return samples[0][0] if samples else self.predict_inference()
+
+        winning_action = max(counts.items(), key=lambda item: item[1])[0]
+        for output_text, first_action in samples:
+            if first_action == winning_action:
+                return output_text
+
+        return samples[0][0]
+
     def confirm_stop(self, navigation):
         confirm_messages = list(self.conversations)
         confirm_messages.append({
@@ -474,7 +498,10 @@ class NaVIDA_Agent(Agent):
                 "content": content
             })
 
-        navigation = self.predict_inference()
+        if self.step_id < OPENING_VOTE_STEPS:
+            navigation = self.sample_opening_vote()
+        else:
+            navigation = self.predict_inference()
         
         if self.require_map:
             img = self.addtext(output_im, observations["instruction"]["text"], navigation)
