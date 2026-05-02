@@ -1,0 +1,341 @@
+====================================
+0502 实验总结
+
+今天围绕两条线做了系统测试：
+1. 执行侧收紧：45度转向最多展开2次（turncap）；
+2. 开局投票：前10步 K=5 首动作投票（openvote10）；
+3. 若干失败方向验证：stop二次评估、只对高风险模式触发投票、温度升高到0.3。
+
+今天最重要的结论：
+1. stop 二次评估不是主线，OSR能升，但SR/SPL明显掉；
+2. 45度转向收紧是一个稳定的小正收益方向；
+3. turncap + openvote10 在 QUCTc6BB5sX 单场景上稳定有效；
+4. full 上这套策略已经接近当前最优 baseline，但还没有稳定超过；
+5. 条件化风险触发投票（只对 right-right-forward / right-right-right 投票）过窄，收益消失；
+6. temperature=0.3 明显太激进，阶段性结果已经严重退化。
+====================================
+
+
+
+====================================
+当前全量最优 baseline
+eval_log/navida_r2r_vllm_baseline_t0p1_full16
+
+Success rate: 1106/1839 (0.6014)
+Oracle success rate: 1249/1839 (0.6792)
+SPL: 983.925/1839 (0.5350)
+Distance to goal: 4.4709
+Path length: 10.5722
+
+说明：
+这是目前全量最优对照组，后续所有方案都以它为主 baseline。
+====================================
+
+
+
+====================================
+0502 单场景基线：QUCTc6BB5sX 原版
+eval_log/quct_origtrace_t0p1_24w_0501_203759
+
+Success rate: 134/255 (0.5255)
+Oracle success rate: 151/255 (0.5922)
+SPL: 119.890/255 (0.4702)
+Distance to goal: 6.5046
+Path length: 12.2535
+
+失败构成：
+oracle_only: 17
+hard_fail: 104
+
+说明：
+这是 QUCTc6BB5sX 单场景的原始基线。
+====================================
+
+
+
+====================================
+0502 单场景：turncap（45度转向最多展开2次）
+eval_log/quct_turncap2_t0p1_24w_0501_214028
+
+Success rate: 136/255 (0.5333)
+Oracle success rate: 154/255 (0.6039)
+SPL: 120.139/255 (0.4711)
+Distance to goal: 6.8325
+Path length: 12.7671
+
+相对原版：
+SR: +0.0078
+OSR: +0.0118
+SPL: +0.0010
+Distance to goal: +0.3279
+Path length: +0.5136
+
+分析结论：
+这是一个“小而稳”的正收益方向。SR有小幅提升，副作用有限。
+====================================
+
+
+
+====================================
+0502 单场景：turncap + openvote10（恢复版，前10步全投票）
+eval_log/quct_turncap2_openvote10_k5_t0p1_24w_0502_113146
+
+Success rate: 143/255 (0.5608)
+Oracle success rate: 159/255 (0.6235)
+SPL: 125.659/255 (0.4928)
+Distance to goal: 6.7670
+Path length: 12.7335
+
+相对原版：
+SR: +0.0353
+OSR: +0.0314
+SPL: +0.0226
+Distance to goal: +0.2624
+Path length: +0.4801
+
+相对 turncap：
+SR: +0.0275
+OSR: +0.0196
+SPL: +0.0217
+Distance to goal: -0.0655
+Path length: -0.0336
+
+失败构成：
+oracle_only: 16
+hard_fail: 96
+
+分析结论：
+这是目前 QUCTc6BB5sX 单场景上的最佳稳定版本。
+前面出现过一次同名策略退化复跑，后面确认是代码路径不一致导致，恢复到真正的“前10步全投票”后，单场景收益能复现。
+====================================
+
+
+
+====================================
+0502 单场景：openvote5（前5步投票）
+eval_log/quct_turncap2_openvote5_k5_t0p1_24w_0501_233712
+
+Success rate: 134/255 (0.5255)
+Oracle success rate: 147/255 (0.5765)
+SPL: 119.883/255 (0.4701)
+Distance to goal: 7.1174
+Path length: 12.1397
+
+分析结论：
+把开局投票窗口从10步收缩到5步后，收益基本消失。
+说明 QUCTc6BB5sX 的高风险期不只在最前5步。
+====================================
+
+
+
+====================================
+0502 单场景：riskvote（只对高风险模式触发投票）
+eval_log/quct_riskvote_t0p1_12w_gpu1_0502_143744
+
+Success rate: 136/255 (0.5333)
+Oracle success rate: 151/255 (0.5922)
+SPL: 119.068/255 (0.4669)
+Distance to goal: 6.9817
+Path length: 12.8099
+
+策略说明：
+前10步不再全投票，只在首个动作串命中以下模式时才做 K=5 投票：
+- right-right-forward
+- right-right-right
+
+分析结论：
+这个条件太窄，没能保住 openvote10 的收益。
+结果只和 turncap 持平甚至略差，说明“仅靠这两类高风险模式”不足以覆盖真正有收益的开局稳定化场景。
+====================================
+
+
+
+====================================
+0502 单场景：stop2x（已证伪）
+eval_log/quct_stop2x_t0p1_24w_0501_193609
+
+Success rate: 110/255 (0.4314)
+Oracle success rate: 164/255 (0.6431)
+SPL: 92.611/255 (0.3632)
+Distance to goal: 8.3622
+Path length: 16.5017
+
+分析结论：
+stop 二次评估能提高 OSR，但会显著拉长路径，SR/SPL明显退化。
+这个方向不再作为主线。
+====================================
+
+
+
+====================================
+0502 全量：turncap + openvote10（第一次 full）
+eval_log/navida_r2r_turncap2_openvote10_k5_t0p1_full24w_0502_000828
+
+Success rate: 1088/1839 (0.5916)
+Oracle success rate: 1251/1839 (0.6803)
+SPL: 968.612/1839 (0.5265)
+Distance to goal: 4.6322
+Path length: 10.7780
+
+相对全量最优 baseline：
+SR: -0.0098
+OSR: +0.0011
+SPL: -0.0085
+Distance to goal: +0.1613
+Path length: +0.2058
+
+分析结论：
+第一次 full 没超过最优 baseline，但已经说明方向有信息量。
+====================================
+
+
+
+====================================
+0502 全量：turncap + openvote10（第二次 full，当前最佳复跑）
+eval_log/navida_r2r_turncap2_openvote10_k5_t0p1_full24w_0502_121544
+
+Success rate: 1105/1839 (0.6009)
+Oracle success rate: 1259/1839 (0.6846)
+SPL: 977.939/1839 (0.5316)
+Distance to goal: 4.4968
+Path length: 10.6385
+
+相对全量最优 baseline：
+SR: -0.0005
+OSR: +0.0054
+SPL: -0.0035
+Distance to goal: +0.0259
+Path length: +0.0664
+
+失败构成：
+oracle_only: 154
+hard_fail: 580
+
+相对 baseline 失败结构：
+baseline oracle_only: 143
+baseline hard_fail: 590
+
+分析结论：
+这轮 full 已经几乎追平当前最优 baseline。
+特点是：
+1. OSR 更高；
+2. hard_fail 更少；
+3. 但 oracle_only 更多，说明更容易到目标附近，但最后收束还略差。
+====================================
+
+
+
+====================================
+0502 全量掉分场景分析（相对 baseline_t0p1_full16）
+
+掉分比较明显的 scene：
+1. EU6Fwq7SyZv: SR -0.0530
+2. Z6MFQCViBuw: SR -0.0440
+3. TbHJrupSAjP: SR -0.0303
+
+场景分析：
+
+EU6Fwq7SyZv：
+- OSR 只小幅下降，但 oracle_only 增加
+- 更像“原本能成功的样本被改成 near-miss”
+- 主问题偏向最后收束变差
+
+Z6MFQCViBuw：
+- hard_fail 明显增多
+- baseline 中一批 SPL 很高的成功样本被改坏
+- 说明 opening vote 在这个 scene 上会把原本稳定的开局分支选偏
+
+TbHJrupSAjP：
+- 同样是路线级退化
+- baseline 中很多高质量成功样本被改成 hard-fail
+
+结论：
+前10步全投票对 QUCTc6BB5sX/2azQ1b91cZZ/8194nk5LbLH 这类开局敏感 scene 有帮助，
+但对另外一些本来 baseline 就稳定的 scene，会把原本正确的 early decision 固化成错误。
+====================================
+
+
+
+====================================
+0502 条件触发投票结论
+
+尝试过的条件：
+1. 只在前10步内触发；
+2. 只在首个动作串命中以下模式时触发：
+   - right-right-forward
+   - right-right-right
+
+结果：
+单场景收益不如 turncap，更远低于 openvote10。
+
+结论：
+条件收得太窄会让 openvote10 的有效部分一起消失。
+“只看两类 right-right-* 模式”不足以刻画真正的高风险开局。
+====================================
+
+
+
+====================================
+0502 温度实验补充
+
+1. baseline + temperature=0.1 仍然是全量基线的最佳设置；
+2. turncap + openvote10 + temperature=0 全量对照：
+eval_log/navida_r2r_turncap2_openvote10_k5_t0p0_full24w_0502_143146
+
+Success rate: 1097/1839 (0.5965)
+Oracle success rate: 1256/1839 (0.6830)
+SPL: 970.564/1839 (0.5278)
+Distance to goal: 4.4784
+Path length: 10.6501
+
+相对 turncap + openvote10 + temperature=0.1：
+SR: -0.0044
+OSR: -0.0016
+SPL: -0.0038
+Distance to goal: -0.0183
+Path length: +0.0116
+
+相对全量最优 baseline：
+SR: -0.0049
+OSR: +0.0038
+SPL: -0.0073
+Distance to goal: +0.0075
+Path length: +0.0779
+
+结论：
+temperature=0 没有带来更好的 full 结果。
+这说明当前 turncap + openvote10 方案的收益，确实部分依赖 temperature=0.1 的采样探索。
+
+3. 实验版 turncap + openvote10 + stop vote + temperature=0.3
+   在 QUCTc6BB5sX 只跑到 76 个样本时就已经明显退化：
+
+阶段性结果（76/255）：
+Success rate: 29/76 (0.3816)
+Oracle success rate: 45/76 (0.5921)
+SPL: 24.345/76 (0.3203)
+Distance to goal: 9.8834
+Path length: 17.0099
+
+结论：
+temperature=0.3 在当前组合下明显过于激进，已停止。
+====================================
+
+
+
+====================================
+0502 当前结论
+
+1. stop 二次评估方向已经证伪，不再作为主线。
+2. turncap（45度最多展开2次）是稳定的小正收益，可保留。
+3. turncap + openvote10 在 QUCTc6BB5sX 单场景上稳定有效。
+4. 全量上，这套策略已经非常接近当前最优 baseline，但仍略输在 SPL / DTG / Path。
+5. 当前最关键的问题不是“能不能更早到附近”，而是“如何把更高的 OSR 转成最终 SR / SPL”。
+
+建议的后续方向：
+1. 保持 turncap 不动；
+2. 不再做 stop2x 或高温大采样；
+3. 继续分析掉分 scene（EU6Fwq7SyZv, Z6MFQCViBuw, TbHJrupSAjP）；
+4. 如果继续做投票，不要再极窄条件化，也不要全局粗暴放大温度；
+5. temperature=0 不如 temperature=0.1，说明“开局投票 + 轻度采样”比“开局投票 + 贪心解码”更有效；
+6. 下一步更值得考虑的是：如何只在真正不稳定的早期状态触发更稳的动作选择，而不是统一前10步全投票。
+====================================

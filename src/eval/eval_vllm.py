@@ -39,7 +39,7 @@ STOP_CONFIRM_PROMPT = (
     "Re-evaluate the current observation and instruction carefully. "
     "Respond with the same action format as before."
 )
-OPENING_VOTE_STEPS = 5
+OPENING_VOTE_STEPS = 10
 OPENING_VOTE_K = 5
 
 BASE_PROMPT_TEMPLATE = "Imagine you are a robot programmed for navigation tasks. "\
@@ -506,7 +506,7 @@ class NaVIDA_Agent(Agent):
         if self.require_map:
             img = self.addtext(output_im, observations["instruction"]["text"], navigation)
             self.topdown_map_list.append(img)
-        
+
         result = self.extract_multi_result(navigation)
         parsed_action_ids = []
 
