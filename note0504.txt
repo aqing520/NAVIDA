@@ -1,0 +1,192 @@
+====================================
+0504 实验总结
+
+今天围绕 NaVIDA Targeted Self-correction Flywheel 做了完整实验：
+1. 在 train split 上 rollout 收集错误状态；
+2. 用 ShortestPathFollower (SPF) 标注 oracle_action；
+3. 构造训练数据，从 checkpoint 继续 SFT；
+4. 评估 correction 模型在 val_seen 和 val_unseen 上的表现。
+
+今天最重要的结论：
+1. 粗粒度 failure oracle imitation 会损害模型性能；
+2. 把整个失败 episode 都标成 oracle_action 不是 targeted correction，而是退化成了普通 oracle imitation learning；
+3. loss 下降 ≠ 性能提升，训练数据分布本身有问题时，loss 越低反而越危险；
+4. 成功 episode 中 SPL 差异大，未过滤低质量成功路径会强化低效行为。
+====================================
+
+
+
+====================================
+实验背景与动机
+
+当前全量最优 baseline：
+eval_log/navida_r2r_vllm_baseline_t0p1_full16
+
+val_seen (778 episodes):
+  SR: 530/778 (0.681)
+  OSR: 589/778 (0.757)
+  SPL: 488.411/778 (0.628)
+
+val_unseen (1839 episodes):
+  SR: 1106/1839 (0.6014)
+  OSR: 1249/1839 (0.6792)
+  SPL: 983.925/1839 (0.5350)
+
+核心瓶颈：OSR 明显高于 SR（能到目标附近但无法成功停止）。
+val_seen OSR 75.7% vs SR 68.1%，gap = 7.6%。
+val_unseen OSR 67.9% vs SR 60.1%，gap = 7.8%。
+
+方案：DAgger 风格的 self-correction flywheel。
+在 train split 上 rollout → 收集错误状态 → SPF 标注 → 构造 correction SFT 数据 → 训练 → 评估。
+====================================
+
+
+
+====================================
+数据构造流程
+
+Stage 1: Rollout Collection (src/data/capture_rollout.py)
+- 在 train split (10,819 episodes) 上用当前模型 rollout
+- 每步记录：agent pose、RGB 帧、model_action、oracle_action (SPF)、distance_to_goal
+- 输出：traces/{episode_id}.jsonl + frames/{episode_id}/frame_{step}.jpg + summaries/{episode_id}.json
+- 结果：10,819 episodes 全部跑完，8,443 成功，2,376 失败
+
+Stage 2: Error Mining (src/data/mine_errors.py)
+- 从 rollout traces 中筛选四类错误状态：
+  Type 1: near-goal no-stop (d_goal ≤ 3.0m, model_action ≠ stop)
+  Type 2: false-stop (d_goal > 3.0m, model_action = stop)
+  Type 3: off-track (agent 到参考路径距离 > 1.5m)
+  Type 4: early unstable (step ≤ 10, model_action ≠ oracle_action)
+- 结果：76,586 个 Type 1 错误
+
+Stage 3: 构造训练数据
+- v3 方案：不单独构造 correction 数据，而是从 rollout 直接构建：
+  - 成功 episodes (8,443): 用 model_action 做 label → 232,934 个样本
+  - 失败 episodes (2,376): 用 oracle_action 做 label → 100,955 个样本
+  - 总计：333,889 个样本，比例约 70:30
+- 数据格式：与 navida_train_data.jsonl 一致（system + conversations + image + task type）
+
+Stage 4: 训练 (scripts/train_correction.sh)
+- 从 base model (models/navida_qwen2_5_vl) 继续训练
+- 5 GPUs (1,2,3,4,5), DeepSpeed ZeRO-2
+- lr=5e-6, batch=80 (4*4*5), 1 epoch, ~4174 steps
+- 输出：result/navida_correction_flywheel_v3/
+- checkpoint-1000 用于评估
+====================================
+
+
+
+====================================
+评估结果
+
+val_seen (777 episodes):
+eval_log/correction_flywheel_v3_step1000_valseen
+
+  SR: 521/777 (0.671)
+  OSR: 574/777 (0.739)
+  SPL: 488.690/777 (0.629)
+  Distance to goal: 3.880
+
+相对 baseline val_seen:
+  SR: -0.010 (68.1% → 67.1%)
+  OSR: -0.018 (75.7% → 73.9%)
+  SPL: +0.001 (62.8% → 62.9%)
+
+val_unseen 采样 200 episodes:
+eval_log/correction_flywheel_v3_step1000_val_unseen_sample
+
+  SR: 114/200 (0.570)
+  OSR: 131/200 (0.655)
+  SPL: 101.474/200 (0.507)
+  Distance to goal: 5.387
+
+相对 baseline val_unseen (全量 1839):
+  SR: -0.031 (60.1% → 57.0%)
+  OSR: -0.024 (67.9% → 65.5%)
+  SPL: -0.028 (53.5% → 50.7%)
+
+结论：两个 split 上 SR/OSR 均下降，SPL 持平或下降。训练没有正向收益。
+====================================
+
+
+
+====================================
+问题分析
+
+问题一：Failure 粒度太粗（最核心）
+
+当前做法：把整个失败 episode 的每一步都标成 fail_oracle (oracle_action)。
+但大多数失败 episode 里大量步其实走对了。
+
+举例：一个 episode 走了 80 步，前 60 步完全没问题，第 65 步该停没停，后面继续走远。
+当前做法把前 60 步也标成 oracle_action，等于在"已经对"的状态上强加 oracle 的动作。
+
+后果：
+- 不是 targeted correction，退化成了普通 oracle imitation learning
+- 真正需要修正的步可能只有几千个，被淹没在 10 万个"假修正"里
+- 模型学到"在正常行走时也跟着 oracle 转"，破坏了原来走对的能力
+
+问题二：Success 质量没过滤
+
+成功 episodes 中 SPL 差异很大：
+- 有些走得很干净，SPL 接近 1.0
+- 有些绕了大圈、来回修正，最后侥幸 stop 成功，SPL 可能才 0.3
+
+用 model_action 训练不区分质量，等于强化低 SPL 的成功行为。
+
+问题三：Loss 降 ≠ 性能升
+
+v3 训练 loss 下降明显，但评估 SR/OSR 都掉了。
+原因：loss 只反映模型拟合 label 的程度，不反映 label 是否正确。
+训练数据分布本身有问题时，模型拟合得越好，性能反而越差。
+
+问题四：没有诊断元信息
+
+训练数据中没有 error_type、d_goal、path_distance 等信息。
+如果 SR 掉、SPL 掉、Path 变长，难以判断是哪类样本导致的。
+====================================
+
+
+
+====================================
+数据构造的正确方向
+
+1. Failure episodes 只提取真正出错的步
+   - 用 mine_errors.py 筛出的 Type 1/2/3/4 错误状态
+   - 每个错误状态用 oracle_action 做 label
+   - 其余"本来走对"的步丢掉或保留 model_action
+   - 这样才是 targeted correction
+
+2. Success episodes 过滤低质量路径
+   - 按 SPL 阈值过滤（如 SPL > 0.7）
+   - 只保留路径质量好的成功样本
+
+3. 添加诊断元信息
+   - 每个样本记录：error_type、d_goal、path_distance、episode_SPL
+   - 训练后可以按类别分析哪些样本导致了性能变化
+
+4. 控制比例
+   - correction 数据（错误步 + oracle_action）应该是少量精准修正
+   - 不应该与 success data 竞争比例
+   - 建议：success (高质量) : correction (精准) = 9:1 或更高
+====================================
+
+
+
+====================================
+0504 当前结论
+
+1. 粗粒度 failure oracle imitation 是错误的数据构造方式，两个 split 上 SR/OSR 均下降。
+2. 76,586 个 Type 1 错误状态已经筛出来了，下一步应该只用这些精准错误步构造 correction 数据。
+3. 成功 episodes 需要按 SPL 过滤，避免强化低效路径。
+4. 训练数据应该添加诊断元信息，便于后续分析。
+5. 当前 checkpoint-1000 不值得继续使用，需要重新构造数据训练。
+
+建议下一步：
+1. 修改 build_original_data_from_rollout.py：
+   - 失败 episodes 只取 mine_errors.py 筛出的错误步
+   - 成功 episodes 按 SPL > 0.7 过滤
+2. correction 数据用 Type 1 错误步 + label="stop"
+3. 混合比例：success (高质量) 90% + correction (精准) 10%
+4. 重新训练并评估
+====================================

@@ -1,0 +1,95 @@
+====================================
+0505 实验总结
+
+1. 生成 R2R 专家数据（action chunking 格式）
+2. 构造 correction 修正数据（对齐专家格式），混合训练并评估
+
+核心结论：
+- 确认原始训练数据使用 action chunking（1-3 个动作合并），不是单个原子动作
+- correction 数据对齐 chunking 格式后训练，checkpoint-1000/4000 均严重退化
+- 模型行为：第一步就 stop 或一直转圈，SR=0%
+- 之前记录的 "val_seen +1.8%, val_unseen +0.5%" 实际是 base model 的结果（vLLM 加载的是 base model，不是 checkpoint）
+====================================
+
+
+
+====================================
+Action Chunking 规则
+
+原始训练数据的 label 是 action chunk，不是单个动作：
+- 70% 概率合并同类型连续动作：forward 25+25=50（最大 75cm），turn 同理（最大 45deg）
+- 不同类型逗号分隔，最多 3 个动作：如 "forward 50 cm, turn right 15 degree"
+- chunk 内动作共享同一组历史帧，chunk 结束后才更新图像
+====================================
+
+
+
+====================================
+专家数据
+
+来源: R2R VLNCE v1-3 train split (10,819 episodes)
+流程: preprocess.py → extract_frame.py → prepare_training_data.py
+输出: data/r2r_expert/navida_train_data.jsonl
+样本数: 270,528
+====================================
+
+
+
+====================================
+Correction 数据（v2，action chunking 版）
+
+错误类型：
+- Type 1 (d_goal ≤ 3.0m, 没停): 76,586 个, label="stop"
+- Type 2 (d_goal > 3.0m, 错误停止): 555 个, label=oracle chunk
+- Type 4 (前10步与oracle不一致): 18,272 个, label=oracle chunk
+
+与 v3 的区别：
+1. 修正数据 label 从单动作改为 action chunk
+2. failure 粒度从整个失败 episode 改为只取真正出错的步
+3. 专家数据从 rollout 构造改为原始专家轨迹
+
+输出: data/correction_expert/correction_train.jsonl
+样本数: 95,413
+====================================
+
+
+
+====================================
+混合数据与训练
+
+混合: 专家 270,528 (90%) + 修正 30,058 (10%) = 300,586
+输出: data/correction_expert/mixed_expert_correction.jsonl
+训练: 6 GPU, lr=5e-6, 1 epoch, checkpoint 每 1000 步
+结果目录: result/navida_correction_v4/
+====================================
+
+
+
+====================================
+评估结果
+
+⚠️ 重要纠正：
+之前记录的 val_seen (SR 69.9%) 和 val_unseen (SR 60.6%) 结果有误。
+实际测试时 vLLM 加载的是 base model (models/navida_qwen2_5_vl)，不是 checkpoint-1000。
+这些数据反映的是 base model 的性能，不是 correction 训练后的效果。
+
+checkpoint-1000 实际测试（val_seen, 采样 70+ episodes）:
+  SR: 0%    模型行为异常：第一步就 stop 或一直转圈
+  原因: correction 数据中 Type 1 (stop label) 占比过高（76,586/95,413 = 80%），导致模型过度学习 stop
+
+checkpoint-4000 实际测试（val_seen, 采样 70+ episodes）:
+  SR: 0%    同样行为异常，一直输出 "turn right"
+
+结论：correction v4 训练方案失败，模型严重退化
+
+失败原因分析：
+1. Type 1 数据占比过高（80%），stop label 过多导致模型倾向于立即停止
+2. Type 4 数据（前10步不一致）可能引入了噪声，模型学到错误的转向模式
+3. 10% correction 混入比例仍然过高，淹没了专家数据中的正常导航行为
+
+下一步：
+- 大幅降低 correction 比例（1-3%）
+- 收紧 Type 1 阈值（d_goal < 2m）
+- 去掉 Type 4 或限制更严格
+- 考虑只用 Type 2（false-stop）数据
+====================================

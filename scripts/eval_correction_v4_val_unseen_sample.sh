@@ -3,17 +3,12 @@
 PYTHON="/data1/conda_envs/embAI_sup/awzy/navida_wzy/bin/python"
 export PYTHONPATH=`pwd`:$PYTHONPATH
 
-#R2R
-CONFIG_PATH="config/vln_r2r.yaml"
-PROMPT_STYLE="baseline" # baseline, stop_hint, or sr_stop
-SAVE_PATH="eval_log/navida_r2r_vllm_valseen"
+CONFIG_PATH="config/vln_r2r_val_unseen.yaml"
+PROMPT_STYLE="baseline"
+SAVE_PATH="eval_log/correction_v4_step1000_val_unseen_sample"
 
-#RxR
-# CONFIG_PATH="config/vln_rxr.yaml"
-# SAVE_PATH="eval_log/navida_rxr" 
-
-CHUNKS=16 # number of Habitat workers / dataset splits
-gpus=(1 1 1 1 2 2 2 2 4 4 4 4 5 5 5 5)
+CHUNKS=8
+gpus=(0 0 0 0 1 1 1 1)
 
 export OPENAI_API_KEY="EMPTY"
 export OPENAI_API_BASE="http://127.0.0.1:8201/v1"
@@ -25,7 +20,6 @@ unset HTTP_PROXY
 unset HTTPS_PROXY
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
-    echo "Launching Habitat worker $IDX on GPU ${gpus[$IDX]}"
     CUDA_VISIBLE_DEVICES=${gpus[$IDX]} $PYTHON src/eval/eval_vllm.py \
     --exp-config $CONFIG_PATH \
     --split-num $CHUNKS \
@@ -36,7 +30,8 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
     --max-action-history 200 \
     --num-generations 1 \
     --prompt-style $PROMPT_STYLE \
-    --result-path $SAVE_PATH &
+    --result-path $SAVE_PATH \
+    --max-episodes 25 &
 done
 
 wait

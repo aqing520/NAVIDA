@@ -3,7 +3,7 @@ export NCCL_P2P_LEVEL=NVL
 MODEL_PATH="models/navida_qwen2_5_vl"
 VLLM_PYTHON="/data1/conda_envs/embAI_sup/awzy/vllmwzy/bin/python"
 
-VLLM_GPU=${VLLM_GPU:-2,3}
+VLLM_GPU=${VLLM_GPU:-4,5}
 TP_SIZE=${TP_SIZE:-2}
 PORT=${PORT:-8201}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
