@@ -50,12 +50,8 @@ Correction 数据（v2，action chunking 版）
 
 输出: data/correction_expert/correction_train.jsonl
 样本数: 95,413
-====================================
 
-
-
-====================================
-混合数据与训练
+混合数据与训练：
 
 混合: 专家 270,528 (90%) + 修正 30,058 (10%) = 300,586
 输出: data/correction_expert/mixed_expert_correction.jsonl
@@ -66,30 +62,38 @@ Correction 数据（v2，action chunking 版）
 
 
 ====================================
-评估结果
+Correction v4（action chunking 对齐版）
 
-⚠️ 重要纠正：
-之前记录的 val_seen (SR 69.9%) 和 val_unseen (SR 60.6%) 结果有误。
-实际测试时 vLLM 加载的是 base model (models/navida_qwen2_5_vl)，不是 checkpoint-1000。
-这些数据反映的是 base model 的性能，不是 correction 训练后的效果。
+数据: 专家 90% + Type 1/2/4 修正 10% = 300,586 samples
+训练: 6 GPU, lr=5e-6, 1 epoch
+结果目录: result/navida_correction_v4/
 
-checkpoint-1000 实际测试（val_seen, 采样 70+ episodes）:
-  SR: 0%    模型行为异常：第一步就 stop 或一直转圈
-  原因: correction 数据中 Type 1 (stop label) 占比过高（76,586/95,413 = 80%），导致模型过度学习 stop
+评估结果:
+- checkpoint-1000: SR=0%（第一步就 stop，Type 1 stop 标签过多）
+- checkpoint-4000: SR=0%（一直转圈）
 
-checkpoint-4000 实际测试（val_seen, 采样 70+ episodes）:
-  SR: 0%    同样行为异常，一直输出 "turn right"
+失败原因：Type 1 (stop label) 占 80%，模型过度学习 stop
+====================================
 
-结论：correction v4 训练方案失败，模型严重退化
+====================================
+Correction v5（参考 CorrectNAV 偏离检测）
+
+思路：检测偏离点（model_action ≠ oracle_action），从偏离点取 oracle 纠错轨迹
+数据: 46,061 samples, correction 比例 2%
+训练: 6 GPU, lr=5e-6, 1 epoch, checkpoint 每 500 步
+结果目录: result/navida_correctnav_v5/
+
+评估结果 (checkpoint-500, val_seen 采样 34 episodes):
+  SR: 0%    模型一直转圈，触发外部旋转限制停止
 
 失败原因分析：
-1. Type 1 数据占比过高（80%），stop label 过多导致模型倾向于立即停止
-2. Type 4 数据（前10步不一致）可能引入了噪声，模型学到错误的转向模式
-3. 10% correction 混入比例仍然过高，淹没了专家数据中的正常导航行为
+1. 训练数据第一个动作 81.6% 是 turn（left 41.5% + right 40.1%），只有 18.4% 是 forward
+2. 原因：偏离检测用的是 rollout 记录的 oracle_action（从 oracle 位置算的），
+   不是从偏离后 agent 实际位置算的
+3. 常见场景：model 往前走了，oracle 说"该转了" → 纠错标签是 turn
+   但从 agent 实际位置看，正确动作可能是继续 forward
+4. 模型学到"偏离就转" → 推理时一直转 → 旋转限制触发停止
 
-下一步：
-- 大幅降低 correction 比例（1-3%）
-- 收紧 Type 1 阈值（d_goal < 2m）
-- 去掉 Type 4 或限制更严格
-- 考虑只用 Type 2（false-stop）数据
+根本问题：纠错轨迹的 oracle_action 基于 oracle 位置，不是 agent 实际位置
+需要：从偏离点的 agent_position 用 ShortestPathFollower 重新规划纠错轨迹
 ====================================
