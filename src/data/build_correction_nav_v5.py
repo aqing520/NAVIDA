@@ -1,20 +1,23 @@
 """
-Build CorrectNAV-style correction training data.
+Build CorrectNAV-style correction training data (v2).
 
-Detects deviation points where model action diverges from oracle action,
-then generates corrective action chunks from the oracle trajectory.
+Geometric deviation detection:
+- Load reference_path from episode annotations
+- Interpolate to dense path T'_g
+- Compute h_t = min distance(agent_position, T'_g) at each step
+- Find first h_t > threshold S as deviation point
+- Use oracle actions from deviation point as corrective label
 
-Key difference from build_correction_data_v2.py:
-- Uses deviation detection (model vs oracle action mismatch at decision steps)
-- Generates complete corrective action chunks from deviation point
-- No "stop" label bias - corrective trajectories naturally contain forward/turn actions
+Only uses FAILED episodes for correction data.
 """
 
 import json
 import os
+import gzip
 import argparse
 import random
 import re
+import numpy as np
 from tqdm import tqdm
 
 
@@ -71,10 +74,7 @@ def combine(action1, action2):
 
 
 def build_action_chunk(action_ids):
-    """
-    Build an action chunk from a sequence of action IDs.
-    Same chunking logic as prepare_training_data.py.
-    """
+    """Build an action chunk from a sequence of action IDs."""
     if not action_ids:
         return None, 0
 
@@ -93,7 +93,6 @@ def build_action_chunk(action_ids):
 
         next_action_str = action_id_to_str(next_action)
 
-        # 70% probability to try merging if same type
         prob = random.random()
         if prob <= 0.7 and next_action == last_action:
             merged = combine(chunk, next_action_str)
@@ -103,16 +102,58 @@ def build_action_chunk(action_ids):
                 actions_used += 1
                 continue
 
-        # Different type or merge failed: try to append with comma
         comma_count = chunk.count(',')
         if comma_count < 2:
             chunk += ', ' + next_action_str
             last_action = next_action
             actions_used += 1
         else:
-            break  # max 3 actions per chunk
+            break
 
     return chunk, actions_used
+
+
+def interpolate_path(waypoints, interval=0.25):
+    """
+    Interpolate a path from waypoints with given interval (meters).
+    Returns dense path as numpy array of shape (N, 3).
+    """
+    if len(waypoints) < 2:
+        return np.array(waypoints)
+
+    waypoints = [np.array(p[:3]) for p in waypoints]
+    dense = [waypoints[0]]
+
+    for i in range(len(waypoints) - 1):
+        seg = waypoints[i+1] - waypoints[i]
+        seg_len = np.linalg.norm(seg)
+        if seg_len < 1e-6:
+            continue
+        n_points = max(1, int(seg_len / interval))
+        for j in range(1, n_points + 1):
+            t = j / n_points
+            point = waypoints[i] + t * seg
+            dense.append(point)
+
+    return np.array(dense)
+
+
+def point_to_path_distance(point, dense_path):
+    """Compute minimum distance from a point to a dense path."""
+    point = np.array(point[:3])
+    diffs = dense_path - point
+    dists = np.linalg.norm(diffs, axis=1)
+    return float(np.min(dists))
+
+
+def load_reference_paths(annotations_path):
+    """Load reference_path for all episodes from annotations."""
+    with gzip.open(annotations_path, 'rt') as f:
+        data = json.load(f)
+    ref_paths = {}
+    for ep in data['episodes']:
+        ref_paths[str(ep['episode_id'])] = ep.get('reference_path', [])
+    return ref_paths
 
 
 def load_traces(rollout_dir):
@@ -142,161 +183,171 @@ def load_traces(rollout_dir):
     return traces
 
 
-def detect_deviations(records):
+def load_summaries(rollout_dir):
+    """Load episode summaries to determine success/fail."""
+    import glob
+    summaries = {}
+    summary_dir = os.path.join(rollout_dir, "summaries")
+    for f in glob.glob(os.path.join(summary_dir, "*.json")):
+        with open(f) as fh:
+            d = json.load(fh)
+            summaries[str(d['episode_id'])] = d
+    return summaries
+
+
+def build_correction_samples(rollout_dir, annotations_path, threshold=1.5,
+                             max_history=8, max_correction_steps=10):
     """
-    Detect deviation points in a rollout trace.
+    Build correction samples using geometric deviation detection.
 
-    A deviation is the first decision step where model_action != oracle_action,
-    AND the model was previously following the oracle (or this is the first step).
-
-    Returns list of deviation dicts with deviation_step and context info.
+    Only from failed episodes. Deviation = first step where
+    distance(agent_position, reference_path) > threshold.
     """
-    deviations = []
-    was_following = True  # Start assuming model follows oracle
+    # Load data
+    ref_paths = load_reference_paths(annotations_path)
+    print(f"Loaded reference paths for {len(ref_paths)} episodes")
 
-    for i, record in enumerate(records):
-        if not record.get("is_decision_step", False):
-            continue
-
-        model_action = record.get("model_action")
-        oracle_action = record.get("oracle_action")
-
-        if model_action is None or oracle_action is None:
-            continue
-
-        if model_action != oracle_action:
-            if was_following:
-                # This is the first deviation point
-                deviations.append({
-                    "deviation_step": record["step"],
-                    "deviation_idx": i,
-                    "model_action": model_action,
-                    "oracle_action": oracle_action,
-                    "distance_to_goal": record.get("distance_to_goal", 0),
-                    "agent_position": record.get("agent_position"),
-                })
-                was_following = False
-        else:
-            was_following = True
-
-    return deviations
-
-
-def build_correction_samples(rollout_dir, max_history=8, max_correction_steps=10):
-    """
-    Build CorrectNAV-style correction training samples.
-
-    For each deviation point:
-    - Get context frames (last max_history frames up to deviation step)
-    - Build corrective action chunk from oracle actions starting at deviation
-    - Output in expert data format
-    """
     traces = load_traces(rollout_dir)
     print(f"Loaded {len(traces)} episode traces")
 
+    summaries = load_summaries(rollout_dir)
+    print(f"Loaded {len(summaries)} episode summaries")
+
+    # Filter to failed episodes only
+    failed_episodes = {eid for eid, s in summaries.items()
+                       if not s.get('final_success', 0)}
+    print(f"Failed episodes: {len(failed_episodes)}")
+
+    # Interpolate reference paths
+    dense_paths = {}
+    for eid, rp in ref_paths.items():
+        if rp and len(rp) >= 2:
+            dense_paths[eid] = interpolate_path(rp, interval=0.25)
+    print(f"Interpolated {len(dense_paths)} reference paths")
+
     samples = []
     skipped = 0
-    episodes_with_deviations = 0
+    no_ref_path = 0
 
-    for episode_id, records in tqdm(traces.items(), desc="Building correction samples"):
-        instruction = records[0].get("instruction", "") if records else ""
+    for episode_id in tqdm(failed_episodes, desc="Processing failed episodes"):
+        records = traces.get(episode_id, [])
+        if not records:
+            skipped += 1
+            continue
+
+        dense_path = dense_paths.get(episode_id)
+        if dense_path is None:
+            no_ref_path += 1
+            continue
+
+        instruction = records[0].get("instruction", "")
         if not instruction:
             continue
 
-        deviations = detect_deviations(records)
-        if not deviations:
+        # Compute deviation distance at each decision step
+        deviation_step = None
+        deviation_idx = None
+        for i, record in enumerate(records):
+            if not record.get("is_decision_step", False):
+                continue
+
+            agent_pos = record.get("agent_position")
+            if agent_pos is None:
+                continue
+
+            h_t = point_to_path_distance(agent_pos, dense_path)
+            if h_t > threshold:
+                deviation_step = record["step"]
+                deviation_idx = i
+                break
+
+        if deviation_idx is None:
+            skipped += 1
             continue
 
-        episodes_with_deviations += 1
+        # Get context frames
+        start = max(0, deviation_idx - max_history + 1)
+        context_frames = []
+        for i in range(start, deviation_idx + 1):
+            fp = records[i].get("frame_path", "")
+            abs_path = os.path.abspath(fp)
+            if os.path.exists(abs_path):
+                context_frames.append(abs_path)
+        if not context_frames:
+            skipped += 1
+            continue
 
-        for dev in deviations:
-            dev_step = dev["deviation_step"]
-            dev_idx = dev["deviation_idx"]
+        # Build corrective action chunk from oracle actions
+        oracle_actions = []
+        for i in range(deviation_idx, min(deviation_idx + max_correction_steps, len(records))):
+            oa = records[i].get("oracle_action")
+            if oa is None:
+                break
+            oracle_actions.append(oa)
+            if oa == 0:
+                break
 
-            # Get context frames (last max_history frames up to deviation step)
-            start = max(0, dev_idx - max_history + 1)
-            context_frames = []
-            for i in range(start, dev_idx + 1):
-                fp = records[i].get("frame_path", "")
-                abs_path = os.path.abspath(fp)
-                if os.path.exists(abs_path):
-                    context_frames.append(abs_path)
-            if not context_frames:
-                skipped += 1
-                continue
+        if not oracle_actions:
+            skipped += 1
+            continue
 
-            # Build corrective action chunk from oracle actions starting at deviation
-            oracle_actions = []
-            for i in range(dev_idx, min(dev_idx + max_correction_steps, len(records))):
-                oa = records[i].get("oracle_action")
-                if oa is None:
-                    break
-                oracle_actions.append(oa)
-                if oa == 0:  # stop ends the sequence
-                    break
+        chunk_str, _ = build_action_chunk(oracle_actions)
+        if chunk_str is None:
+            skipped += 1
+            continue
 
-            if not oracle_actions:
-                skipped += 1
-                continue
+        prompt = VLN_PROMPT_TEMPLATE.format(instruction)
 
-            # If first oracle action is stop, skip (not a useful correction)
-            if oracle_actions[0] == 0:
-                skipped += 1
-                continue
+        sample = {
+            "system": "You are a helpful assistant.",
+            "conversations": [
+                {
+                    "from": "user",
+                    "value": prompt,
+                    "image": context_frames
+                },
+                {
+                    "from": "assistant",
+                    "value": chunk_str
+                }
+            ],
+            "action_history": [],
+            "task type": "vln",
+            "episode_id": str(episode_id),
+            "source": "correctnav_geometric_deviation",
+            "deviation_step": deviation_step,
+            "deviation_distance": float(point_to_path_distance(
+                records[deviation_idx].get("agent_position", [0,0,0]), dense_path)),
+            "distance_to_goal": records[deviation_idx].get("distance_to_goal", 0),
+        }
+        samples.append(sample)
 
-            chunk_str, _ = build_action_chunk(oracle_actions)
-            if chunk_str is None or chunk_str == "stop":
-                skipped += 1
-                continue
-
-            prompt = VLN_PROMPT_TEMPLATE.format(instruction)
-
-            sample = {
-                "system": "You are a helpful assistant.",
-                "conversations": [
-                    {
-                        "from": "user",
-                        "value": prompt,
-                        "image": context_frames
-                    },
-                    {
-                        "from": "assistant",
-                        "value": chunk_str
-                    }
-                ],
-                "action_history": [],
-                "task type": "vln",
-                "episode_id": str(episode_id),
-                "source": "correctnav_deviation",
-                "deviation_step": dev_step,
-                "model_action": dev["model_action"],
-                "oracle_action": dev["oracle_action"],
-                "distance_to_goal": dev["distance_to_goal"],
-            }
-            samples.append(sample)
-
-    print(f"Episodes with deviations: {episodes_with_deviations}")
-    print(f"Built {len(samples)} correction samples, skipped {skipped}")
+    print(f"\nResults:")
+    print(f"  Total failed episodes: {len(failed_episodes)}")
+    print(f"  No reference path: {no_ref_path}")
+    print(f"  Skipped (no frames, etc): {skipped}")
+    print(f"  Built samples: {len(samples)}")
     return samples
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build CorrectNAV-style correction data")
-    parser.add_argument("--rollout-dir", type=str, required=True,
-                        help="Directory containing traces/")
-    parser.add_argument("--output", type=str, required=True,
-                        help="Output path for correction training data jsonl")
-    parser.add_argument("--max-history", type=int, default=8,
-                        help="Max history frames")
-    parser.add_argument("--max-correction-steps", type=int, default=10,
-                        help="Max steps to look ahead for corrective actions")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for chunking")
+    parser = argparse.ArgumentParser(description="Build CorrectNAV-style correction data (geometric deviation)")
+    parser.add_argument("--rollout-dir", type=str, required=True)
+    parser.add_argument("--annotations-path", type=str, required=True,
+                        help="Path to train.json.gz with reference_path")
+    parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--threshold", type=float, default=1.5,
+                        help="Deviation threshold in meters")
+    parser.add_argument("--max-history", type=int, default=8)
+    parser.add_argument("--max-correction-steps", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     random.seed(args.seed)
 
-    samples = build_correction_samples(args.rollout_dir, args.max_history, args.max_correction_steps)
+    samples = build_correction_samples(
+        args.rollout_dir, args.annotations_path,
+        args.threshold, args.max_history, args.max_correction_steps)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
@@ -306,16 +357,15 @@ def main():
     # Stats
     stats = {
         "rollout_dir": args.rollout_dir,
+        "annotations_path": args.annotations_path,
         "total_samples": len(samples),
+        "threshold": args.threshold,
         "seed": args.seed,
-        "max_correction_steps": args.max_correction_steps,
     }
 
-    # Analyze action distribution
     action_dist = {}
     for s in samples:
         label = s["conversations"][1]["value"]
-        # Extract first action type
         if "stop" in label:
             action_dist["stop"] = action_dist.get("stop", 0) + 1
         elif "forward" in label:
@@ -326,16 +376,19 @@ def main():
             action_dist["turn_right"] = action_dist.get("turn_right", 0) + 1
     stats["action_distribution"] = action_dist
 
-    # Analyze distance_to_goal distribution
-    distances = [s["distance_to_goal"] for s in samples]
+    first_actions = {}
+    for s in samples:
+        label = s["conversations"][1]["value"]
+        first = label.split(',')[0].strip().split()[0]
+        first_actions[first] = first_actions.get(first, 0) + 1
+    stats["first_action_distribution"] = first_actions
+
+    distances = [s["deviation_distance"] for s in samples]
     if distances:
-        stats["distance_to_goal"] = {
+        stats["deviation_distance"] = {
             "mean": sum(distances) / len(distances),
             "min": min(distances),
             "max": max(distances),
-            "lt_3m": sum(1 for d in distances if d < 3.0),
-            "lt_5m": sum(1 for d in distances if d < 5.0),
-            "gte_5m": sum(1 for d in distances if d >= 5.0),
         }
 
     stats_path = args.output.replace(".jsonl", "_stats.json")
@@ -345,11 +398,9 @@ def main():
     print(f"\nOutput: {args.output}")
     print(f"Stats: {stats_path}")
     print(f"Action distribution: {action_dist}")
+    print(f"First action distribution: {first_actions}")
     if distances:
-        print(f"Distance to goal: mean={stats['distance_to_goal']['mean']:.1f}m, "
-              f"<3m: {stats['distance_to_goal']['lt_3m']}, "
-              f"<5m: {stats['distance_to_goal']['lt_5m']}, "
-              f">=5m: {stats['distance_to_goal']['gte_5m']}")
+        print(f"Deviation distance: mean={stats['deviation_distance']['mean']:.2f}m")
 
 
 if __name__ == "__main__":

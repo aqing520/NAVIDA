@@ -97,3 +97,42 @@ Correction v5（参考 CorrectNAV 偏离检测）
 根本问题：纠错轨迹的 oracle_action 基于 oracle 位置，不是 agent 实际位置
 需要：从偏离点的 agent_position 用 ShortestPathFollower 重新规划纠错轨迹
 ====================================
+
+
+
+====================================
+Correction v6（几何偏离检测，只取失败 episode）
+
+思路：参考 CorrectNAV，用 agent 到 reference_path 距离 > 阈值检测偏离点
+数据构造: src/data/build_correction_nav_v5.py, threshold=3.0m
+只取失败 episode 的偏离点，从偏离点开始取 oracle action 构造 action chunk
+
+数据: 专家 270,528 (99.44%) + 修正 1,531 (0.56%) = 272,059
+训练: 6 GPU, lr=5e-6, 1 epoch, checkpoint 每 100 步
+结果目录: result/navida_correctnav_v6/
+
+评估结果 (checkpoint-100, val_seen 采样 22 episodes):
+  SR: 9.09%    OSR: 18.18%    SPL: 5.84%
+  对比 baseline 同 episode: SR 大幅下降
+
+失败原因：学习率仍然过高，模型对修正数据过拟合
+====================================
+
+
+
+====================================
+Correction v7（降低学习率到 5e-7）
+
+与 v6 相同数据和方法，仅降低学习率
+训练: 6 GPU, lr=5e-7, 1 epoch, checkpoint 每 50 步
+结果目录: result/navida_correctnav_v7/
+
+评估结果 (checkpoint-50, val_seen 采样 38 episodes):
+  V7 SR: 50.00%    OSR: 63.16%    SPL: 46.60%
+  Baseline SR (同 episode): 71.05%
+  Delta: -21.05%
+
+失败原因：即使 lr=5e-7，继续在专家数据上训练仍导致性能退化
+根本问题：不是学习率的问题，而是从 base model 继续训专家数据会破坏已有能力
+可能解法：需要完全不同训练策略（如 LoRA、只训 correction 数据、或冻结大部分参数）
+====================================
