@@ -17,6 +17,7 @@ import datasets
 from datasets import load_dataset
 import sys
 from qwen_vl_utils import process_vision_info
+from peft import LoraConfig, get_peft_model
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,26 @@ class ModelArguments:
             "help": "Which attention implementation to use. You can run `--attn_implementation=flash_attention_2`, in "
             "which case you must install this manually by running `pip install flash-attn --no-build-isolation`."
         },
+    )
+    use_lora: bool = field(
+        default=False,
+        metadata={"help": "Enable LoRA adapter training."},
+    )
+    lora_r: int = field(
+        default=16,
+        metadata={"help": "LoRA rank."},
+    )
+    lora_alpha: int = field(
+        default=32,
+        metadata={"help": "LoRA alpha."},
+    )
+    lora_dropout: float = field(
+        default=0.05,
+        metadata={"help": "LoRA dropout."},
+    )
+    lora_target_modules: str = field(
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        metadata={"help": "Comma-separated target module names for LoRA."},
     )
     
 
@@ -189,6 +210,20 @@ def collate_fn(examples):
     return batch
 
 
+def log_trainable_parameters(model):
+    trainable_params = 0
+    all_params = 0
+    for _, param in model.named_parameters():
+        count = param.numel()
+        all_params += count
+        if param.requires_grad:
+            trainable_params += count
+    ratio = 100 * trainable_params / all_params if all_params else 0.0
+    logger.info(
+        f"Trainable params: {trainable_params} / {all_params} ({ratio:.4f}%)"
+    )
+
+
 
 
 def main(model_args, data_args, training_args):
@@ -236,8 +271,8 @@ def main(model_args, data_args, training_args):
     ################
     # Load datasets
     ################
-    dataset = load_dataset("json",data_files = data_args.dataset_name)
-    dataset.shuffle(seed=42)
+    dataset = load_dataset("json", data_files=data_args.dataset_name)
+    dataset["train"] = dataset["train"].shuffle(seed=42)
 
     global processor
     processor = AutoProcessor.from_pretrained(
@@ -271,8 +306,28 @@ def main(model_args, data_args, training_args):
     for p in model.visual.merger.parameters():
         p.requires_grad = True
 
-    # model.enable_input_require_grads() # important when using adapter
+    if model_args.use_lora:
+        target_modules = [
+            item.strip() for item in model_args.lora_target_modules.split(",")
+            if item.strip()
+        ]
+        lora_config = LoraConfig(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=target_modules,
+        )
+        model.enable_input_require_grads()
+        model = get_peft_model(model, lora_config)
+        logger.info(
+            "Enabled LoRA training with target modules: %s",
+            ", ".join(target_modules),
+        )
+
     logger.info(f"*** Model in {torch_dtype}***")
+    log_trainable_parameters(model)
     
 
     ############################

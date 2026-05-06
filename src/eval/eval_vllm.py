@@ -96,7 +96,7 @@ def observations_instruction_text(observations):
 
 def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path, num_generations,
                     forward_distance, turn_angle, max_action_history, resolution_ratio, prompt_style,
-                    temperature, max_episodes) -> None:
+                    temperature, max_episodes, model_id=None) -> None:
     if len(dataset.episodes) == 0:
         if result_queue is not None:
             result_queue.put({"t_episode": 0, "empty_split": 1})
@@ -114,7 +114,8 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
         resolution_ratio, 
         num_generations,
         prompt_style,
-        temperature)
+        temperature,
+        model_id)
 
     num_episodes = len(env.episodes)
     if max_episodes is not None:
@@ -196,7 +197,7 @@ def evaluate_agent(result_queue, api_key, base_url, config, dataset, result_path
 class NaVIDA_Agent(Agent):
     def __init__(self, api_key, base_url, result_path, forward_distance, 
                     turn_angle, max_action_history, resolution_ratio, num_generations = 1,
-                    prompt_style="baseline", temperature=0.2, require_map=True):
+                    prompt_style="baseline", temperature=0.2, model_id=None, require_map=True):
         
         print("Initialize NaVIDA")
         
@@ -216,7 +217,17 @@ class NaVIDA_Agent(Agent):
             api_key=api_key,
             base_url=base_url,
         )
-        self.model = self.client.models.list().data[0].id
+        available_models = self.client.models.list().data
+        if model_id is not None:
+            if not any(model.id == model_id for model in available_models):
+                available_ids = ", ".join(model.id for model in available_models)
+                raise ValueError(
+                    f"Requested model_id '{model_id}' not found on vLLM server. "
+                    f"Available models: {available_ids}"
+                )
+            self.model = model_id
+        else:
+            self.model = available_models[0].id
         
         self.sampling_params = SimpleNamespace(
             n=1,
@@ -578,6 +589,8 @@ def main():
                         help="optional maximum number of episodes to evaluate in each split")
     parser.add_argument("--scene-id", type=str, default=None,
                         help="optional scene name filter, e.g. QUCTc6BB5sX")
+    parser.add_argument("--model-id", type=str, default=None,
+                        help="optional model ID exposed by the vLLM server; use this to select a LoRA adapter explicitly")
     args = parser.parse_args()
 
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -623,7 +636,7 @@ def main():
         evaluate_agent(None, api_key, base_url, config, dataset_splits[args.split_id], args.result_path,
                 args.num_generations, args.forward_distance, args.turn_angle,
                 args.max_action_history, args.resolution_ratio, args.prompt_style,
-                args.temperature, args.max_episodes)
+                args.temperature, args.max_episodes, args.model_id)
         return
 
     num_episodes = len(dataset.episodes)
@@ -637,7 +650,7 @@ def main():
         worker_args = (result_queue, api_key, base_url, config, dataset_splits[i], args.result_path,
                 args.num_generations, args.forward_distance, args.turn_angle, 
                 args.max_action_history, args.resolution_ratio, args.prompt_style,
-                args.temperature, args.max_episodes)
+                args.temperature, args.max_episodes, args.model_id)
         p = mp.Process(target=evaluate_agent, args=worker_args, daemon=True)
         p.start()
         processes.append(p)

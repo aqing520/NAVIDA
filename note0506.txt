@@ -1,0 +1,111 @@
+0506 记录（v8 数据构造与当前结果）
+
+一、v8 数据怎么构造
+
+1. correction 数据不再直接用 trace 里的旧 oracle_action。
+   做法：
+   - 从 baseline rollout：`data/rollout_train_baseline/traces/*.jsonl` 找 failed episodes
+   - 用原始标注：`data/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz` 的 `reference_path`
+   - 在 trace 的真实 `agent_position + agent_rotation` 上重放
+   - 用 Habitat `ShortestPathFollower` 从真实偏离状态重算 recovery actions
+   - 再转回训练用 chunk
+
+2. correction 过滤规则
+   - 只取首个明显偏离点
+   - deviation distance: `1.5m ~ 3.5m`
+   - goal distance: `2m ~ 20m`
+   - max recovery steps: `6`
+   - 首动作为 `stop` 直接丢
+   - recovery 进展不足直接丢
+
+3. anchor 数据来源
+   - baseline 成功 episode 的 decision steps
+   - failed episode 中，偏离前且 `model_action == oracle_action` 的正常前缀
+
+4. 最终数据统计
+   anchor:
+   - success samples: `120000`
+   - failed prefix samples: `12749`
+   - total: `132749`
+
+   correction:
+   - total failed episodes: `2376`
+   - built samples: `218`
+   - skip reasons:
+     - `insufficient_progress`: `1484`
+     - `no_deviation`: `356`
+     - `goal_too_close`: `144`
+     - `starts_with_stop`: `163`
+     - `goal_too_far`: `11`
+   - first action distribution:
+     - `forward`: `96`
+     - `turn`: `122`
+
+5. 训练混合方式
+   correction 太少，没直接和 13 万 anchor 全混。
+   实际训练用：
+   - `correction_train_x10.jsonl`: `2180`
+   - `anchor_train_8720.jsonl`: `8720`
+   - mixed total: `10900`
+   - 比例约：`anchor 80% / correction 20%`
+
+6. 训练方式
+   - base: `models/navida_qwen2_5_vl`
+   - LoRA 训练，不再 full finetune
+   - trainable params: `37152768 / 3791775744 (0.9798%)`
+   - 训练完成 checkpoint:
+     - `checkpoint-100`
+     - `checkpoint-200`
+     - `checkpoint-228`
+
+二、目前结果
+
+1. vLLM 全量 val_seen（注意：vLLM 只加载 language side LoRA，visual LoRA 被忽略）
+   LoRA:
+   - path: `eval_log/navida_correctnav_v8_ckpt228_vllm_valseen_full32`
+   - `SR 0.6941`
+   - `OSR 0.7622`
+   - `SPL 0.6327`
+   - `DTG 3.6134`
+
+   baseline:
+   - path: `eval_log/navida_r2r_vllm_valseen`
+   - `SR 0.6812`
+   - `OSR 0.7571`
+   - `SPL 0.6278`
+   - `DTG 3.7508`
+
+   结论：
+   - val_seen 小幅提升
+   - 但这是 vLLM 下的 language-only LoRA 效果，不是完整多模态 LoRA
+
+2. vLLM 全量 val_unseen
+   - path: `eval_log/navida_correctnav_v8_ckpt228_vllm_valunseen_full32`
+   - `SR 0.590`
+   - `OSR 0.676`
+   - `SPL 0.518`
+   - `DTG 4.708`
+
+   结论：
+   - unseen 效果一般
+   - 没体现出很强泛化提升
+
+3. 原生 transformers 完整 LoRA 测试
+   - 目标目录：`eval_log/navida_correctnav_v8_ckpt228_val_unseen_full8`
+   - 这是 `eval.py --lora-path checkpoint-228`，能测到完整 LoRA
+   - `SR 0.587`
+   - `OSR 0.682`
+   - `SPL 0.521`
+   - `DTG 4.621`
+
+三、当前阶段判断
+
+1. v8 相比前几版，至少没有再出现明显的 stop 崩坏或转圈崩坏。
+2. seen 上有小幅真实收益。
+3. 完整 LoRA（非 vLLM）和 vLLM val_unseen 结果几乎一致：`0.587` vs `0.590`。
+4. 说明问题不在 vLLM，根因还是 correction 训练本身没有提升 unseen 泛化。
+5. 压缩结论：
+   - correction 数据太窄：真实有效样本只有 `218`
+   - 学到的是局部 recovery 补丁，不是完整泛化策略
+   - seen 可小幅获益，unseen 基本无提升，甚至轻微退化
+   - 这条 correction SFT 路线目前没有证明能稳定提升整体导航性能
