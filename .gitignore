@@ -3,3 +3,7 @@ models/*
 eval_log/*
 __pycache__/
 *.pyc
+.cache/
+result/
+CLAUDE.md
+.claude
