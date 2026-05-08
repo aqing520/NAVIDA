@@ -1,19 +1,22 @@
 #!/bin/bash
 
 PYTHON="/data1/conda_envs/embAI_sup/navida_wzy/bin/python"
-export PYTHONPATH=`pwd`:$PYTHONPATH
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
 #R2R
-CONFIG_PATH="config/vln_r2r.yaml"
-PROMPT_STYLE="baseline" # baseline, stop_hint, or sr_stop
-SAVE_PATH="eval_log/navida_r2r_vllm_official_gpu0_${PROMPT_STYLE}"
+CONFIG_PATH=${CONFIG_PATH:-"config/vln_r2r_seen.yaml"}
+PROMPT_STYLE=${PROMPT_STYLE:-"baseline"} # baseline, stop_hint, or sr_stop
+SAVE_PATH=${SAVE_PATH:-"eval_log/qwen3vl4b_ckpt200_r2r_valseen_vllm_gpu0_${PROMPT_STYLE}"}
 
 #RxR
 # CONFIG_PATH="config/vln_rxr.yaml"
 # SAVE_PATH="eval_log/navida_rxr" 
 
-CHUNKS=8 # number of Habitat workers / dataset splits
-gpus=(2 2 5 5 6 6 0 0)
+CHUNKS=${CHUNKS:-2} # conservative default because GPU 7 is partially occupied on this machine
+HABITAT_GPU=${HABITAT_GPU:-7}
 
 export OPENAI_API_KEY="EMPTY"
 export OPENAI_API_BASE="http://127.0.0.1:8201/v1"
@@ -25,8 +28,8 @@ unset HTTP_PROXY
 unset HTTPS_PROXY
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
-    echo "Launching Habitat worker $IDX on GPU ${gpus[$IDX]}"
-    CUDA_VISIBLE_DEVICES=${gpus[$IDX]} $PYTHON src/eval/eval_vllm.py \
+    echo "Launching Habitat worker $IDX on GPU ${HABITAT_GPU}"
+    CUDA_VISIBLE_DEVICES=${HABITAT_GPU} $PYTHON src/eval/eval_vllm.py \
     --exp-config $CONFIG_PATH \
     --split-num $CHUNKS \
     --split-id $IDX \
