@@ -103,7 +103,7 @@ pip install flash-attn --no-build-isolation --no-cache-dir
 Place the datasets as follows:
 ```
 data/
-├── scene_datasets/
+├── scene_dataset/
 │   ├── mp3d/          # MP3D scenes for R2R/RxR/EnvDrop
 │   └── hm3d/          # HM3D scenes for ScaleVLN (train split)
 ```

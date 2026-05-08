@@ -8,6 +8,7 @@ import transformers
 from transformers import (
     set_seed, 
     AutoProcessor, 
+    AutoModelForImageTextToText,
     TrainingArguments,
     TrainerCallback,
     Trainer
@@ -21,6 +22,85 @@ from qwen_vl_utils import process_vision_info
 logger = logging.getLogger(__name__)
 
 processor = None
+
+
+def _safe_batch_meta(example):
+    first_conv = example.get("conversations", [{}])[0]
+    image_field = first_conv.get("image")
+    if isinstance(image_field, list):
+        num_images = len(image_field)
+    elif image_field:
+        num_images = 1
+    else:
+        num_images = 0
+
+    sample_id = (
+        example.get("id")
+        or example.get("episode_id")
+        or example.get("video")
+        or "NA"
+    )
+    task_type = example.get("task type", "NA")
+    answer = example.get("conversations", [{}])[-1].get("value", "")
+    return task_type, sample_id, num_images, repr(answer[:120])
+
+
+def check_model_finite(model, step, rank, max_report=20):
+    bad = []
+    for name, p in model.named_parameters():
+        if p is None:
+            continue
+        data = p.data
+        if data is not None and torch.is_floating_point(data):
+            if not torch.isfinite(data).all():
+                bad.append(name)
+                if len(bad) >= max_report:
+                    break
+    if bad:
+        print(
+            f"[BAD_PARAM_BEFORE_FORWARD][rank={rank}][step={step}] {bad}",
+            flush=True,
+        )
+        raise RuntimeError("Model parameters already contain NaN/Inf before forward")
+
+
+def resolve_torch_dtype(dtype_name: Optional[str]):
+    if dtype_name in (None, "auto"):
+        return dtype_name
+    return getattr(torch, dtype_name)
+
+
+def log_trainable_parameters(model):
+    total_params = 0
+    trainable_params = 0
+    for param in model.parameters():
+        count = param.numel()
+        total_params += count
+        if param.requires_grad:
+            trainable_params += count
+    ratio = 100 * trainable_params / total_params if total_params else 0
+    logger.info(
+        "Trainable params: %s / %s (%.2f%%)",
+        f"{trainable_params:,}",
+        f"{total_params:,}",
+        ratio,
+    )
+
+
+def freeze_linear_attention_modules(model):
+    frozen_params = 0
+    frozen_modules = set()
+    for name, param in model.named_parameters():
+        if ".linear_attn." in name:
+            param.requires_grad = False
+            frozen_params += param.numel()
+            module_name = name.rsplit(".", 1)[0]
+            frozen_modules.add(module_name)
+    logger.info(
+        "Frozen linear_attn params: %s across %s modules",
+        f"{frozen_params:,}",
+        len(frozen_modules),
+    )
 
 @dataclass
 class DataArguments:
@@ -52,6 +132,60 @@ class LogCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if state.is_local_process_zero:
             self.logger.info(logs)
+
+
+class DebugTrainer(Trainer):
+    def __init__(self, *args, debug_raw_loss: bool = False, debug_raw_loss_steps: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.debug_raw_loss = debug_raw_loss
+        self.debug_raw_loss_steps = debug_raw_loss_steps
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        rank = os.environ.get("LOCAL_RANK", "NA")
+        step = self.state.global_step
+        if self.debug_raw_loss:
+            check_model_finite(model, step, rank)
+
+        outputs = model(**inputs)
+        if isinstance(outputs, dict):
+            loss = outputs["loss"]
+        else:
+            loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+
+        labels = inputs.get("labels", None)
+        valid = (labels != -100).sum().item() if labels is not None else -1
+
+        if self.debug_raw_loss and step < self.debug_raw_loss_steps:
+            logger.info(
+                "RAW_LOSS rank=%s step=%s value=%.8f valid_labels=%s",
+                rank,
+                step,
+                float(loss.detach().float().cpu()),
+                valid,
+            )
+
+        if self.debug_raw_loss and not torch.isfinite(loss.detach()):
+            print(f"[NAN_LOSS][rank={rank}][step={step}]", flush=True)
+            for k, v in inputs.items():
+                if torch.is_tensor(v):
+                    if torch.is_floating_point(v):
+                        finite = torch.isfinite(v).all().item()
+                        msg = (
+                            f"[INPUT][rank={rank}][step={step}] "
+                            f"{k} shape={tuple(v.shape)} dtype={v.dtype} finite={finite}"
+                        )
+                        if finite and v.numel() > 0:
+                            msg += f" min={v.min().item()} max={v.max().item()}"
+                        print(msg, flush=True)
+                    else:
+                        print(
+                            f"[INPUT][rank={rank}][step={step}] "
+                            f"{k} shape={tuple(v.shape)} dtype={v.dtype}",
+                            flush=True,
+                        )
+            raise RuntimeError("NaN raw loss detected")
+
+        return (loss, outputs) if return_outputs else loss
 
 
 def uniform_sample_with_ends(data, n):
@@ -142,17 +276,53 @@ def convert_example(example):
 
 
 def collate_fn(examples):
-    texts = [
-        processor.apply_chat_template(convert_example(example)["messages"], tokenize=False, add_generation_prompt=False)
-        for example in examples
-    ]
+    texts = []
+    prompt_texts = []
     image_inputs = []
+    debug_raw_loss = os.environ.get("NAVIDA_DEBUG_RAW_LOSS", "0") == "1"
+
     for example in examples:
+        messages = convert_example(example)["messages"]
+        texts.append(
+            processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )
+        )
+        prompt_texts.append(
+            processor.apply_chat_template(
+                messages[:-1],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        )
         imgs, vids = process_vision_info(example["messages"])
         imgs = [item.resize((308,252)) for item in imgs]
         image_inputs.append(imgs)
+
+    if debug_raw_loss:
+        rank = os.environ.get("LOCAL_RANK", "NA")
+        batch_meta = [_safe_batch_meta(example) for example in examples]
+        print(
+            f"[BATCH_META][rank={rank}] "
+            f"tasks={[m[0] for m in batch_meta]} "
+            f"ids={[m[1] for m in batch_meta]} "
+            f"num_images={[m[2] for m in batch_meta]} "
+            f"answer={[m[3] for m in batch_meta]}",
+            flush=True,
+        )
+
     batch = processor(
         text=texts,
+        images=image_inputs,
+        return_tensors="pt",
+        padding=True,
+    )
+    prompt_batch = processor(
+        text=prompt_texts,
         images=image_inputs,
         return_tensors="pt",
         padding=True,
@@ -162,30 +332,27 @@ def collate_fn(examples):
     labels[labels == processor.tokenizer.pad_token_id] = -100
     image_token_id = processor.tokenizer.convert_tokens_to_ids(processor.image_token)
     labels[labels == image_token_id] = -100
-    
-    '''
-    mask system prompt and user instructons
-    '''
-    for input_id,label,text,example in zip(batch["input_ids"],labels,texts,examples):
-        rounds = text.split('<|im_end|>\n<|im_start|>')
-        sys_prompt = rounds[0]
-        sys_prompt_len = len(processor.tokenizer(sys_prompt)['input_ids']) + 2 #+2 for <|im_end|>\n
-        rounds = rounds[1:]
-        padded_token_id = torch.where(input_id == processor.tokenizer.pad_token_id)[0]
-        if len(padded_token_id) != 0 and processor.tokenizer.padding_side == 'left':
-            assert torch.all(label[:padded_token_id[-1]+1] == -100)
-            label[padded_token_id[-1]+1:sys_prompt_len+padded_token_id[-1]+1] = -100
-            cur_len = sys_prompt_len + padded_token_id[-1]+1
-        else:
-            label[:sys_prompt_len] = -100
-            cur_len = sys_prompt_len
-        for i, (instruction,response) in enumerate(zip(rounds[0::2],rounds[1::2])):
-            instruction_len = len(processor.tokenizer(instruction)['input_ids'])+6 # +6 for <|im_start|> and <|im_end|>\n<|im_start|> and one assistant\n
-            label[cur_len:cur_len + instruction_len] = -100
-            response_len = len(processor.tokenizer(response)['input_ids']) -2 + 2 # -2 for assistant\n  +2 for <|im_end|>\n
-            response_tmp = input_id[cur_len + instruction_len+1:cur_len + instruction_len + response_len-5]
-            cur_len += instruction_len + response_len
+
+    # Mask the full prompt prefix and train only on assistant continuation tokens.
+    prompt_lengths = prompt_batch["attention_mask"].sum(dim=1).tolist()
+    for label, prompt_len in zip(labels, prompt_lengths):
+        label[:prompt_len] = -100
+
+    valid_label_counts = (labels != -100).sum(dim=1)
+    if (valid_label_counts == 0).any():
+        rank = os.environ.get("LOCAL_RANK", "NA")
+        print(f"[ZERO_LABEL][rank={rank}] {valid_label_counts.tolist()}", flush=True)
+        raise RuntimeError("zero supervised tokens")
+
     batch["labels"] = labels
+
+    for k, v in batch.items():
+        if torch.is_tensor(v) and torch.is_floating_point(v):
+            if not torch.isfinite(v).all():
+                rank = os.environ.get("LOCAL_RANK", "NA")
+                print(f"[BAD_INPUT_IN_COLLATE][rank={rank}] key={k}", flush=True)
+                raise RuntimeError(f"Bad tensor in collate: {k}")
+
     return batch
 
 
@@ -236,13 +403,14 @@ def main(model_args, data_args, training_args):
     ################
     # Load datasets
     ################
-    dataset = load_dataset("json",data_files = data_args.dataset_name)
-    dataset.shuffle(seed=42)
+    dataset = load_dataset("json", data_files=data_args.dataset_name)
+    dataset = dataset.shuffle(seed=42)
 
     global processor
     processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path, use_fast=False
         )
+    processor.tokenizer.padding_side = "right"
 
 
     logger.info("Using AutoProcessor for VLM model.")
@@ -254,10 +422,11 @@ def main(model_args, data_args, training_args):
     torch_dtype = (
             torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)
             )
-    from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_args.model_name_or_path, 
-                                                     attn_implementation = model_args.attn_implementation,
-                                                     torch_dtype=model_args.torch_dtype)
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_args.model_name_or_path,
+        attn_implementation=model_args.attn_implementation,
+        torch_dtype=resolve_torch_dtype(model_args.torch_dtype),
+    )
 
     model = model.to(torch_dtype)
     # set accepts_loss_kwargs for loss scaler bug when setting gradient_accumulation_steps > 1
@@ -266,13 +435,21 @@ def main(model_args, data_args, training_args):
     ###################
     #  (Optional) Frozen vision encoder
     ###################
-    for p in model.visual.parameters():
-        p.requires_grad = False
-    for p in model.visual.merger.parameters():
-        p.requires_grad = True
+    visual_module = getattr(model, "visual", None)
+    if visual_module is None:
+        visual_module = getattr(getattr(model, "model", None), "visual", None)
+    if visual_module is not None:
+        for p in visual_module.parameters():
+            p.requires_grad = False
+        if hasattr(visual_module, "merger"):
+            for p in visual_module.merger.parameters():
+                p.requires_grad = True
+
+    freeze_linear_attention_modules(model)
 
     # model.enable_input_require_grads() # important when using adapter
     logger.info(f"*** Model in {torch_dtype}***")
+    log_trainable_parameters(model)
     
 
     ############################
@@ -282,11 +459,15 @@ def main(model_args, data_args, training_args):
     #     "skip_prepare_dataset": True,
     # }
     training_args.remove_unused_columns = False
-    trainer = Trainer(
+    debug_raw_loss = os.environ.get("NAVIDA_DEBUG_RAW_LOSS", "0") == "1"
+    debug_raw_loss_steps = int(os.environ.get("NAVIDA_DEBUG_RAW_LOSS_STEPS", "0"))
+    trainer = DebugTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset['train'],
         data_collator=collate_fn,
+        debug_raw_loss=debug_raw_loss,
+        debug_raw_loss_steps=debug_raw_loss_steps,
     )
 
     ###############
