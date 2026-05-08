@@ -7,6 +7,7 @@ import logging
 import transformers
 from transformers import (
     set_seed, 
+    AutoConfig,
     AutoProcessor, 
     AutoModelForImageTextToText,
     TrainingArguments,
@@ -22,6 +23,7 @@ from qwen_vl_utils import process_vision_info
 logger = logging.getLogger(__name__)
 
 processor = None
+IGNORE_LABEL_TOKEN_IDS = set()
 
 
 def _safe_batch_meta(example):
@@ -68,6 +70,48 @@ def resolve_torch_dtype(dtype_name: Optional[str]):
     if dtype_name in (None, "auto"):
         return dtype_name
     return getattr(torch, dtype_name)
+
+
+def render_chat_template(messages, add_generation_prompt: bool):
+    kwargs = dict(
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+    try:
+        return processor.apply_chat_template(
+            messages,
+            enable_thinking=False,
+            **kwargs,
+        )
+    except TypeError:
+        return processor.apply_chat_template(messages, **kwargs)
+
+
+def collect_ignore_label_token_ids(processor, model_config):
+    ignore_ids = set()
+    tokenizer = processor.tokenizer
+
+    if tokenizer.pad_token_id is not None:
+        ignore_ids.add(tokenizer.pad_token_id)
+
+    for attr_name in (
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    ):
+        token_id = getattr(model_config, attr_name, None)
+        if token_id is not None:
+            ignore_ids.add(token_id)
+
+    for attr_name in ("image_token", "video_token"):
+        token = getattr(processor, attr_name, None)
+        if token:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None and token_id >= 0:
+                ignore_ids.add(token_id)
+
+    return ignore_ids
 
 
 def log_trainable_parameters(model):
@@ -283,22 +327,8 @@ def collate_fn(examples):
 
     for example in examples:
         messages = convert_example(example)["messages"]
-        texts.append(
-            processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=False,
-            )
-        )
-        prompt_texts.append(
-            processor.apply_chat_template(
-                messages[:-1],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        )
+        texts.append(render_chat_template(messages, add_generation_prompt=False))
+        prompt_texts.append(render_chat_template(messages[:-1], add_generation_prompt=True))
         imgs, vids = process_vision_info(example["messages"])
         imgs = [item.resize((308,252)) for item in imgs]
         image_inputs.append(imgs)
@@ -329,9 +359,8 @@ def collate_fn(examples):
     )
 
     labels = batch["input_ids"].clone()
-    labels[labels == processor.tokenizer.pad_token_id] = -100
-    image_token_id = processor.tokenizer.convert_tokens_to_ids(processor.image_token)
-    labels[labels == image_token_id] = -100
+    for token_id in IGNORE_LABEL_TOKEN_IDS:
+        labels[labels == token_id] = -100
 
     # Mask the full prompt prefix and train only on assistant continuation tokens.
     prompt_lengths = prompt_batch["attention_mask"].sum(dim=1).tolist()
@@ -407,13 +436,17 @@ def main(model_args, data_args, training_args):
     dataset = dataset.shuffle(seed=42)
 
     global processor
+    global IGNORE_LABEL_TOKEN_IDS
     processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path, use_fast=False
         )
     processor.tokenizer.padding_side = "right"
+    model_config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+    IGNORE_LABEL_TOKEN_IDS = collect_ignore_label_token_ids(processor, model_config)
 
 
     logger.info("Using AutoProcessor for VLM model.")
+    logger.info("Ignoring labels for special token ids: %s", sorted(IGNORE_LABEL_TOKEN_IDS))
 
     ###################
     # Model init kwargs
@@ -431,6 +464,9 @@ def main(model_args, data_args, training_args):
     model = model.to(torch_dtype)
     # set accepts_loss_kwargs for loss scaler bug when setting gradient_accumulation_steps > 1
     model.accepts_loss_kwargs = False
+
+    if training_args.gradient_checkpointing:
+        model.enable_input_require_grads()
 
     ###################
     #  (Optional) Frozen vision encoder

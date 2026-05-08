@@ -4,7 +4,7 @@ MODEL_PATH="models/navida_qwen2_5_vl"
 VLLM_PYTHON="/data1/conda_envs/embAI_sup/vllmwzy/bin/python"
 VLLM_GPU=${VLLM_GPU:-3}
 PORT=${PORT:-8201}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.8}
 
 CUDA_VISIBLE_DEVICES=$VLLM_GPU $VLLM_PYTHON -m vllm.entrypoints.cli.main serve "$MODEL_PATH" --runner generate \
     --trust-remote-code --limit-mm-per-prompt '{"image": 99999}' \
