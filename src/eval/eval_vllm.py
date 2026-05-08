@@ -65,6 +65,11 @@ def seed_all():
     np.random.seed(41)
     random.seed(41)
 
+
+def append_jsonl(path, record):
+    with open(path, "a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -171,6 +176,7 @@ class NaVIDA_Agent(Agent):
         os.makedirs(self.result_path, exist_ok=True)
         os.makedirs(os.path.join(self.result_path, "log"), exist_ok=True)
         os.makedirs(os.path.join(self.result_path, "video"), exist_ok=True)
+        os.makedirs(os.path.join(self.result_path, "trace"), exist_ok=True)
 
         self.client = OpenAI(
             api_key=api_key,
@@ -219,6 +225,50 @@ class NaVIDA_Agent(Agent):
         output_text = output_text.strip()
         
         return output_text
+
+    def _message_text(self, content):
+        text_parts = []
+        for item in content:
+            if item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            elif item.get("type") == "image_url":
+                text_parts.append("<image>")
+        return "\n".join(text_parts)
+
+    def _build_step_record(
+        self,
+        step_idx,
+        observations,
+        info,
+        raw_output,
+        chosen_action,
+        action_source,
+    ):
+        record = {
+            "episode_id": self.episode_id,
+            "step_idx": step_idx,
+            "distance_to_goal": info.get("distance_to_goal"),
+            "success": info.get("success"),
+            "raw_output": raw_output,
+            "chosen_action": chosen_action,
+            "action_source": action_source,
+            "history_frames": len(self.rgb_list),
+            "pending_action_queue": list(self.pending_action_list),
+        }
+        if step_idx == 0:
+            record["instruction"] = observations["instruction"]["text"]
+            record["user_prompt"] = (
+                self._message_text(self.conversations[-1]["content"])
+                if len(self.conversations) > 1
+                else None
+            )
+        return record
+
+    def _log_step(self, record):
+        append_jsonl(
+            os.path.join(self.result_path, "trace", f"trace_{self.episode_id}.jsonl"),
+            record,
+        )
 
     def extract_multi_result(self, output):
         sub_actions = [item for item in re.split(r'\s*,\s*', output.strip()) if item]
@@ -326,6 +376,7 @@ class NaVIDA_Agent(Agent):
         self.conversations.append({
             "role": "system",
             "content": [{"type": "text", "text": SYSTEM_PROMPT}]})
+        self.step_idx = 0
         
     def act(self, observations, info, episode_id):
 
@@ -350,7 +401,19 @@ class NaVIDA_Agent(Agent):
             if self.require_map:
                 img = self.addtext(output_im, observations["instruction"]["text"], "Pending action: {}".format(temp_action))
                 self.topdown_map_list.append(img)
-            return {"action": temp_action}
+            chosen_action = {"action": temp_action}
+            self._log_step(
+                self._build_step_record(
+                    step_idx=self.step_idx,
+                    observations=observations,
+                    info=info,
+                    raw_output=None,
+                    chosen_action=chosen_action,
+                    action_source="pending_queue",
+                )
+            )
+            self.step_idx += 1
+            return chosen_action
 
         # for observation1+observation2 action style
         self.conversations = self.conversations[:1]
@@ -373,12 +436,17 @@ class NaVIDA_Agent(Agent):
             })
 
         navigation = self.predict_inference()
+        raw_navigation = navigation
         
         if self.require_map:
             img = self.addtext(output_im, observations["instruction"]["text"], navigation)
             self.topdown_map_list.append(img)
         
         result = self.extract_multi_result(navigation)
+        parsed_actions = [
+            {"action_id": action_index, "value": numeric}
+            for action_index, numeric in result
+        ]
 
         select_action_idx = 2
 
@@ -402,10 +470,21 @@ class NaVIDA_Agent(Agent):
             if action_index is None or len(self.pending_action_list)==0:
                 print('random select an action')
                 action_index = random.randint(1, 3)
-                navigation = self.action_id_to_str(action_index)
                 self.pending_action_list.append(action_index)
 
-        return {"action": self.pending_action_list.pop(0)}
+        chosen_action = {"action": self.pending_action_list.pop(0)}
+        self._log_step(
+            self._build_step_record(
+                step_idx=self.step_idx,
+                observations=observations,
+                info=info,
+                raw_output=raw_navigation,
+                chosen_action=chosen_action,
+                action_source="model",
+            )
+        )
+        self.step_idx += 1
+        return chosen_action
 
 
 def main():
