@@ -5,19 +5,20 @@ export NAVIDA_DEBUG_RAW_LOSS_STEPS=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MODEL_PATH="$REPO_ROOT/models/Qwen3-VL-4B-Instruct"
-TRAIN_FILE="$REPO_ROOT/data/train_r2r_rxr_qwen3vl4b_full.jsonl"
-OUTPUT_DIR="$REPO_ROOT/result/qwen3vl4b_r2r_rxr_formal_freeze_linear_attn"
+TRAIN_FILE="$REPO_ROOT/data/train_r2r_rxr_envdrop_scalevln_qwen3vl4b_full.jsonl"
+OUTPUT_DIR="$REPO_ROOT/result/qwen3vl4b_r2r_rxr_envdrop_scalevln_4gpu"
 
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
 if [ ! -f "$TRAIN_FILE" ]; then
-  cat "$REPO_ROOT/data/navida_train_data_r2r.jsonl" "$REPO_ROOT/data/navida_train_data_streamvln_rxr.jsonl" > "$TRAIN_FILE"
+  echo "Training file not found: $TRAIN_FILE"
+  exit 1
 fi
 
-CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 /data1/conda_envs/embAI_sup/awzy/navida_wzy/bin/python -m torch.distributed.run \
-    --nproc_per_node=6 \
-    --master_port 25435 \
+CUDA_VISIBLE_DEVICES=3,4,5,6 /data1/conda_envs/embAI_sup/awzy/navida_wzy/bin/python -m torch.distributed.run \
+    --nproc_per_node=4 \
+    --master_port 25436 \
     "$REPO_ROOT/src/train/train.py" \
     --dataset_name "$TRAIN_FILE" \
     --model_name_or_path "$MODEL_PATH" \
@@ -29,7 +30,7 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 /data1/conda_envs/embAI_sup/awzy/navida_wzy/bin
     --warmup_ratio 0.01 \
     --gradient_checkpointing True \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 12 \
+    --gradient_accumulation_steps 18 \
     --dataloader_num_workers 0 \
     --dataloader_pin_memory False \
     --learning_rate 5.0e-6 \
