@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES=3,4,5,6 /data1/conda_envs/embAI_sup/awzy/navida_wzy/bin/pyt
     --warmup_ratio 0.01 \
     --gradient_checkpointing True \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 18 \
+    --gradient_accumulation_steps 16 \
     --dataloader_num_workers 0 \
     --dataloader_pin_memory False \
     --learning_rate 5.0e-6 \
