@@ -1,44 +1,43 @@
+export PYTHONPATH="./:$PYTHONPATH"
 export NCCL_P2P_LEVEL=NVL
-export NAVIDA_DEBUG_RAW_LOSS=0
-export NAVIDA_DEBUG_RAW_LOSS_STEPS=0
+export NAVIDA_DEBUG_RAW_LOSS="${NAVIDA_DEBUG_RAW_LOSS:-0}"
+export NAVIDA_DEBUG_RAW_LOSS_STEPS="${NAVIDA_DEBUG_RAW_LOSS_STEPS:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MODEL_PATH="$REPO_ROOT/models/Qwen3-VL-4B-Instruct"
-TRAIN_FILE="$REPO_ROOT/data/train_r2r_rxr_qwen3vl4b_full.jsonl"
-OUTPUT_DIR="$REPO_ROOT/result/qwen3vl4b_r2r_rxr_formal_freeze_linear_attn"
+
+MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/models/Qwen3-VL-4B-Instruct}"
+TRAIN_FILE="${TRAIN_FILE:-$REPO_ROOT/data/train_r2r_rxr_qwen3vl4b_full.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/result/qwen3vl4b_r2r_streamvln_rxr_zero2}"
+DEEPSPEED_BIN="${DEEPSPEED_BIN:-/data1/conda_envs/embAI_sup/awzy/navida_wzy/bin/deepspeed}"
+MASTER_PORT="${MASTER_PORT:-25435}"
+CUDA_VISIBLE_DEVICES_VALUE="${CUDA_VISIBLE_DEVICES_VALUE:-3,4,5,6}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+SAVE_STEPS="${SAVE_STEPS:-200}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
 
 cd "$REPO_ROOT"
-export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
-if [ ! -f "$TRAIN_FILE" ]; then
-  cat "$REPO_ROOT/data/navida_train_data_r2r.jsonl" "$REPO_ROOT/data/navida_train_data_streamvln_rxr.jsonl" > "$TRAIN_FILE"
-fi
-
-CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 /data1/conda_envs/embAI_sup/awzy/navida_wzy/bin/python -m torch.distributed.run \
-    --nproc_per_node=6 \
-    --master_port 25435 \
-    "$REPO_ROOT/src/train/train.py" \
+CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES_VALUE" "$DEEPSPEED_BIN" --master_port "$MASTER_PORT" src/train/train.py \
+    --deepspeed scripts/zero2.json \
     --dataset_name "$TRAIN_FILE" \
     --model_name_or_path "$MODEL_PATH" \
     --num_train_epochs 1 \
     --bf16 \
     --torch_dtype bfloat16 \
-    --attn_implementation sdpa \
+    --attn_implementation flash_attention_2 \
     --lr_scheduler_type cosine \
-    --warmup_ratio 0.01 \
     --gradient_checkpointing True \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 12 \
-    --dataloader_num_workers 0 \
-    --dataloader_pin_memory False \
-    --learning_rate 5.0e-6 \
-    --max_grad_norm 1.0 \
-    --weight_decay 0.0 \
-    --logging_steps 10 \
+    --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
+    --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
+    --dataloader_num_workers 4 \
+    --dataloader_pin_memory \
+    --learning_rate 2.0e-5 \
+    --logging_steps 5 \
     --eval_strategy no \
     --save_strategy steps \
-    --save_steps 200 \
-    --save_total_limit 5 \
+    --save_steps "$SAVE_STEPS" \
+    --save_total_limit "$SAVE_TOTAL_LIMIT" \
     --output_dir "$OUTPUT_DIR" \
     --report_to tensorboard
