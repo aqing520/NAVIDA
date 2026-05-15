@@ -4,6 +4,10 @@ eval_log/*
 __pycache__/
 *.pyc
 .cache/
+.vllm_cache_root/
+.vllm_inductor_cache/
+.vllm_triton_cache/
+.vllm_tmp/
 result/
 CLAUDE.md
 .claude
