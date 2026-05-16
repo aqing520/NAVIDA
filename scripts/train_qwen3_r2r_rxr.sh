@@ -14,30 +14,44 @@ MASTER_PORT="${MASTER_PORT:-25435}"
 CUDA_VISIBLE_DEVICES_VALUE="${CUDA_VISIBLE_DEVICES_VALUE:-3,4,5,6}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
+ENABLE_DATALOADER_PIN_MEMORY="${ENABLE_DATALOADER_PIN_MEMORY:-0}"
 SAVE_STEPS="${SAVE_STEPS:-200}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 cd "$REPO_ROOT"
 
-CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES_VALUE" "$DEEPSPEED_BIN" --master_port "$MASTER_PORT" src/train/train.py \
-    --deepspeed scripts/zero2.json \
-    --dataset_name "$TRAIN_FILE" \
-    --model_name_or_path "$MODEL_PATH" \
-    --num_train_epochs 1 \
-    --bf16 \
-    --torch_dtype bfloat16 \
-    --attn_implementation flash_attention_2 \
-    --lr_scheduler_type cosine \
-    --gradient_checkpointing True \
-    --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
-    --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
-    --dataloader_num_workers 4 \
-    --dataloader_pin_memory \
-    --learning_rate 2.0e-5 \
-    --logging_steps 5 \
-    --eval_strategy no \
-    --save_strategy steps \
-    --save_steps "$SAVE_STEPS" \
-    --save_total_limit "$SAVE_TOTAL_LIMIT" \
-    --output_dir "$OUTPUT_DIR" \
+cmd=(
+    "$DEEPSPEED_BIN" --master_port "$MASTER_PORT" src/train/train.py
+    --deepspeed scripts/zero2.json
+    --dataset_name "$TRAIN_FILE"
+    --model_name_or_path "$MODEL_PATH"
+    --num_train_epochs 1
+    --bf16
+    --torch_dtype bfloat16
+    --attn_implementation flash_attention_2
+    --lr_scheduler_type cosine
+    --gradient_checkpointing True
+    --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE"
+    --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
+    --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
+    --learning_rate 2.0e-5
+    --logging_steps 5
+    --eval_strategy no
+    --save_strategy steps
+    --save_steps "$SAVE_STEPS"
+    --save_total_limit "$SAVE_TOTAL_LIMIT"
+    --output_dir "$OUTPUT_DIR"
     --report_to tensorboard
+)
+
+if [[ "$ENABLE_DATALOADER_PIN_MEMORY" == "1" ]]; then
+    cmd+=(--dataloader_pin_memory)
+fi
+
+if [[ -n "$RESUME_FROM_CHECKPOINT" ]]; then
+    cmd+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
+fi
+
+CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES_VALUE" "${cmd[@]}"
