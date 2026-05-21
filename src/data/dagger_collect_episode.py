@@ -49,6 +49,10 @@ GOAL_RADIUS = 0.25
 RELATIVE_PATH_LENGTH_THRESHOLD = 0.93
 SUCCESS_RELATIVE_PATH_LENGTH_THRESHOLD = 0.85
 RESCUE_ACTION_LEN = 4
+SHORT_RESCUE_MAX_EVENTS = 1
+RESCUE_WINDOW_BEFORE = 2
+RESCUE_WINDOW_AFTER = 2
+STOP_WINDOW_ACTIONS = 4
 DEFAULT_EPISODE_LENGTH = 60
 
 
@@ -56,12 +60,12 @@ DATASET_CONFIG = {
     "r2r": {
         "config_path": "config/vln_r2r_train.yaml",
         "annotation_path": "data/sub_dataset/r2r.jsonl",
-        "default_output_dir": "data/dagger/r2r_dagger_v1",
+        "default_output_dir": "data/dagger/r2r_daggerv2",
     },
     "rxr": {
         "config_path": "config/vln_rxr_train.yaml",
         "annotation_path": "data/sub_dataset/streamvln_rxr.jsonl",
-        "default_output_dir": "data/dagger/rxr_dagger_v1",
+        "default_output_dir": "data/dagger/rxr_daggerv2",
     },
 }
 
@@ -209,6 +213,55 @@ def safe_mean(values: List[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def classify_rescue_tier(num_rescue_events: int) -> str:
+    if num_rescue_events <= 0:
+        return "clean"
+    if num_rescue_events <= SHORT_RESCUE_MAX_EVENTS:
+        return "short_rescue"
+    return "long_rescue"
+
+
+def build_training_segments(
+    num_actions: int,
+    rescue_spans: List[Tuple[int, int]],
+    terminal_stop: bool,
+    rescue_tier: str,
+) -> List[Dict]:
+    segments: List[Dict] = []
+    seen = set()
+
+    def add_segment(segment_type: str, start_action_idx: int, end_action_idx: int) -> None:
+        start_action_idx = max(0, int(start_action_idx))
+        end_action_idx = min(num_actions, int(end_action_idx))
+        if end_action_idx <= start_action_idx:
+            return
+        key = (segment_type, start_action_idx, end_action_idx)
+        if key in seen:
+            return
+        seen.add(key)
+        segments.append(
+            {
+                "segment_type": segment_type,
+                "start_action_idx": start_action_idx,
+                "end_action_idx": end_action_idx,
+            }
+        )
+
+    if rescue_tier == "clean":
+        add_segment("full", 0, num_actions)
+    else:
+        for idx, (start_action_idx, end_action_idx) in enumerate(rescue_spans):
+            add_segment(
+                f"rescue_window_{idx}",
+                start_action_idx - RESCUE_WINDOW_BEFORE,
+                end_action_idx + RESCUE_WINDOW_AFTER,
+            )
+
+    if terminal_stop:
+        add_segment("stop_window", num_actions - STOP_WINDOW_ACTIONS, num_actions)
+    return segments
+
+
 @dataclass
 class EpisodeOutcome:
     episode_id: int
@@ -221,7 +274,9 @@ class EpisodeOutcome:
     action_source: List[str]
     num_rescue_events: int
     model_success: bool
+    rescue_tier: str
     kept_reason: str
+    training_segments: List[Dict]
 
 
 class DAggerRolloutAgent(Agent):
@@ -488,6 +543,10 @@ class EpisodeCollector:
             "relative_pl_threshold": RELATIVE_PATH_LENGTH_THRESHOLD,
             "success_relative_pl_threshold": SUCCESS_RELATIVE_PATH_LENGTH_THRESHOLD,
             "rescue_action_len": RESCUE_ACTION_LEN,
+            "short_rescue_max_events": SHORT_RESCUE_MAX_EVENTS,
+            "rescue_window_before": RESCUE_WINDOW_BEFORE,
+            "rescue_window_after": RESCUE_WINDOW_AFTER,
+            "stop_window_actions": STOP_WINDOW_ACTIONS,
             "max_episodes": self.args.max_episodes,
             "max_debug_videos": self.args.max_debug_videos,
             "split_num": self.args.split_num,
@@ -625,6 +684,8 @@ class EpisodeCollector:
         num_model_actions = 0
         num_expert_actions = 0
         last_navigation = "rollout start"
+        rescue_spans: List[Tuple[int, int]] = []
+        rescue_event_start_idx: Optional[int] = None
 
         current_rgb = self.agent.observe(observation)
         kept_rgb_frames.append(current_rgb)
@@ -632,12 +693,14 @@ class EpisodeCollector:
         while not env.episode_over:
             top_down_map = metrics.get("top_down_map")
             oracle_action = self.get_oracle_action(expert, ref_path, next_waypoint_id)
+            current_action_is_rescue = False
 
             if rescue_remaining > 0:
                 action = oracle_action
                 source = "expert"
                 rescue_remaining -= 1
                 last_navigation = f"expert rescue: {self.agent.action_id_to_str(action)}"
+                current_action_is_rescue = True
             else:
                 if not model_pending_actions:
                     model_pending_actions, last_navigation = self.agent.plan_actions(observation)
@@ -668,10 +731,12 @@ class EpisodeCollector:
                 num_rescue_events += 1
                 accumulated_error = 0
                 model_pending_actions = []
+                rescue_event_start_idx = len(actions)
                 action = self.get_oracle_action(expert, ref_path, next_waypoint_id)
                 source = "expert"
                 rescue_remaining = RESCUE_ACTION_LEN - 1
                 last_navigation = f"expert rescue: {self.agent.action_id_to_str(action)}"
+                current_action_is_rescue = True
 
             if action == 0 and not force_episode_end:
                 action = self.get_oracle_action(expert, ref_path, next_waypoint_id)
@@ -700,12 +765,19 @@ class EpisodeCollector:
                 num_model_actions += 1
             else:
                 num_expert_actions += 1
+            if current_action_is_rescue and rescue_event_start_idx is not None and rescue_remaining == 0:
+                rescue_spans.append((rescue_event_start_idx, len(actions)))
+                rescue_event_start_idx = None
 
             if force_episode_end:
                 break
 
+        if rescue_event_start_idx is not None:
+            rescue_spans.append((rescue_event_start_idx, len(actions)))
+
         relative_pl = initial_distance / max(initial_distance, float(metrics["path_length"]))
         rescued = not model_success
+        rescue_tier = classify_rescue_tier(num_rescue_events)
         kept_reason = ""
         terminal_stop = bool(actions) and actions[-1] == 0
         kept = terminal_stop and metrics["distance_to_goal"] < MIDGOAL_RADIUS and (
@@ -713,7 +785,13 @@ class EpisodeCollector:
             or (relative_pl < SUCCESS_RELATIVE_PATH_LENGTH_THRESHOLD)
         )
         if kept:
-            kept_reason = "rescued_good_path" if rescued else "clean_good_path"
+            if rescue_tier == "clean":
+                kept_reason = "clean_good_path"
+            elif rescue_tier == "short_rescue":
+                kept_reason = "short_rescue_good_path"
+            else:
+                kept_reason = "long_rescue_good_path"
+        training_segments = build_training_segments(len(actions), rescue_spans, terminal_stop, rescue_tier)
 
         outcome = EpisodeOutcome(
             episode_id=episode_id,
@@ -726,7 +804,9 @@ class EpisodeCollector:
             action_source=action_source,
             num_rescue_events=num_rescue_events,
             model_success=model_success,
+            rescue_tier=rescue_tier,
             kept_reason=kept_reason,
+            training_segments=training_segments,
         )
         metric_row = {
             "episode_id": episode_id,
@@ -745,9 +825,11 @@ class EpisodeCollector:
             "num_rescue_events": num_rescue_events,
             "accumulated_error_max": accumulated_error_max,
             "model_success": model_success,
+            "rescue_tier": rescue_tier,
             "terminal_stop": terminal_stop,
             "kept": kept,
             "kept_reason": kept_reason,
+            "num_training_segments": len(training_segments),
         }
         return outcome, metric_row, debug_frames, kept_rgb_frames
 
@@ -786,6 +868,9 @@ class EpisodeCollector:
         self.debug_video_count += 1
 
     def build_summary(self, metrics_all: List[Dict], metrics_kept: List[Dict]) -> Dict:
+        kept_clean = [row for row in metrics_kept if row["rescue_tier"] == "clean"]
+        kept_short = [row for row in metrics_kept if row["rescue_tier"] == "short_rescue"]
+        kept_long = [row for row in metrics_kept if row["rescue_tier"] == "long_rescue"]
         return {
             "dataset": self.dataset_name,
             "num_episodes": len(metrics_all),
@@ -797,6 +882,10 @@ class EpisodeCollector:
             "avg_num_rescue_events": safe_mean([float(row["num_rescue_events"]) for row in metrics_all]),
             "avg_kept_pl": safe_mean([row["pl"] for row in metrics_kept]),
             "avg_kept_distance_to_goal": safe_mean([row["distance_to_goal"] for row in metrics_kept]),
+            "num_kept_clean": len(kept_clean),
+            "num_kept_short_rescue": len(kept_short),
+            "num_kept_long_rescue": len(kept_long),
+            "avg_kept_segments": safe_mean([float(row["num_training_segments"]) for row in metrics_kept]),
         }
 
 
