@@ -19,9 +19,10 @@ DATASET_ANNOTATION_PATH = {
     "rxr": "data/sub_dataset/streamvln_rxr.jsonl",
 }
 
-DEFAULT_PREPARED_SUBDIR = "prepared_daggerv2"
+DEFAULT_PREPARED_SUBDIR = "prepared_daggerv3"
 FORWARD_DISTANCE = 25
 TURN_ANGLE = 15
+DEFAULT_CORRECTION_TARGET_PRIMITIVE_LEN = 5
 
 
 def action_id_to_str(action_id: int) -> str:
@@ -107,6 +108,40 @@ def find_expert_spans(action_source: List[str]) -> List[Tuple[int, int]]:
     return spans
 
 
+def trim_trailing_stop(
+    actions: List[int],
+    segment_end_idx: int,
+) -> Tuple[List[int], int, bool]:
+    trimmed_actions = list(actions)
+    trimmed = False
+    while trimmed_actions and trimmed_actions[-1] == 0:
+        trimmed_actions.pop()
+        segment_end_idx -= 1
+        trimmed = True
+    return trimmed_actions, segment_end_idx, trimmed
+
+
+def build_correction_segment(
+    actions: List[int],
+    start_idx: int,
+    end_idx: int,
+    target_primitive_len: int,
+    drop_terminal_stop: bool,
+) -> Tuple[List[int], int, int, bool]:
+    segment_end_idx = end_idx
+    while segment_end_idx < len(actions) and (segment_end_idx - start_idx) < target_primitive_len:
+        segment_end_idx += 1
+
+    segment_actions = actions[start_idx:segment_end_idx]
+    trimmed_terminal_stop = False
+    if drop_terminal_stop:
+        segment_actions, segment_end_idx, trimmed_terminal_stop = trim_trailing_stop(
+            segment_actions,
+            segment_end_idx,
+        )
+    return segment_actions, start_idx, segment_end_idx, trimmed_terminal_stop
+
+
 def build_alt_path_rows(
     dataset: str,
     annotations: List[Dict],
@@ -154,8 +189,20 @@ def build_alt_path_rows(
     return rows
 
 
-def build_correction_rows(dataset: str, annotations: List[Dict], min_correction_len: int) -> List[Dict]:
+def build_correction_rows(
+    dataset: str,
+    annotations: List[Dict],
+    min_correction_len: int,
+    target_primitive_len: int,
+    drop_terminal_stop: bool,
+) -> Tuple[List[Dict], Dict[str, int]]:
     rows: List[Dict] = []
+    stats = {
+        "num_correction_spans": 0,
+        "num_trimmed_terminal_stop_rows": 0,
+        "num_suffix_extended_rows": 0,
+        "num_empty_after_trim_rows": 0,
+    }
     for item in annotations:
         action_source = list(item.get("action_source", []))
         if not action_source:
@@ -165,11 +212,23 @@ def build_correction_rows(dataset: str, annotations: List[Dict], min_correction_
         if dataset == "r2r" and isinstance(instruction, list) and instruction:
             instruction = instruction[0]
         for span_idx, (start_idx, end_idx) in enumerate(find_expert_spans(action_source)):
+            stats["num_correction_spans"] += 1
             if end_idx - start_idx < min_correction_len:
                 continue
-            segment_actions = actions[start_idx:end_idx]
+            segment_actions, frame_start_idx, frame_end_idx, trimmed_terminal_stop = build_correction_segment(
+                actions=actions,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                target_primitive_len=target_primitive_len,
+                drop_terminal_stop=drop_terminal_stop,
+            )
             if not segment_actions:
+                stats["num_empty_after_trim_rows"] += 1
                 continue
+            if frame_end_idx > end_idx:
+                stats["num_suffix_extended_rows"] += 1
+            if trimmed_terminal_stop:
+                stats["num_trimmed_terminal_stop_rows"] += 1
             rows.append(
                 {
                     "episode_id": int(item["episode_id"]),
@@ -178,14 +237,14 @@ def build_correction_rows(dataset: str, annotations: List[Dict], min_correction_
                     "actions": segment_actions,
                     "segment_type": "correction",
                     "segment_id": f"{item['episode_id']}_correction_{span_idx}",
-                    "frame_start_idx": start_idx,
-                    "frame_end_idx": end_idx,
+                    "frame_start_idx": frame_start_idx,
+                    "frame_end_idx": frame_end_idx,
                     "num_rescue_events": int(item.get("num_rescue_events", 0)),
                     "segment_len": len(segment_actions),
                     "step_diff_vs_ref": None,
                 }
             )
-    return rows
+    return rows, stats
 
 
 def process_single_type(
@@ -301,6 +360,8 @@ def build_training_files(
     max_abs_step_diff: int,
     max_step_diff_ratio: float,
     min_correction_len: int,
+    correction_target_primitive_len: int,
+    drop_correction_terminal_stop: bool,
 ) -> None:
     kept_annotations_path = os.path.join(input_dir, "kept_annotations.json")
     annotations = load_kept_annotations(kept_annotations_path)
@@ -313,10 +374,12 @@ def build_training_files(
         max_abs_step_diff=max_abs_step_diff,
         max_step_diff_ratio=max_step_diff_ratio,
     )
-    correction_rows = build_correction_rows(
+    correction_rows, correction_stats = build_correction_rows(
         dataset,
         annotations,
         min_correction_len=min_correction_len,
+        target_primitive_len=correction_target_primitive_len,
+        drop_terminal_stop=drop_correction_terminal_stop,
     )
     sub_dataset = alt_path_rows + correction_rows
     random.shuffle(sub_dataset)
@@ -365,6 +428,9 @@ def build_training_files(
         "max_abs_step_diff": max_abs_step_diff,
         "max_step_diff_ratio": max_step_diff_ratio,
         "min_correction_len": min_correction_len,
+        "correction_target_primitive_len": correction_target_primitive_len,
+        "drop_correction_terminal_stop": drop_correction_terminal_stop,
+        **correction_stats,
         "num_sub_dataset_rows": len(sub_dataset),
         "num_vln_rows": len(vln_rows),
         "num_idm_rows": len(idm_rows),
@@ -382,6 +448,8 @@ def parse_args():
     parser.add_argument("--max-abs-step-diff", type=int, default=6)
     parser.add_argument("--max-step-diff-ratio", type=float, default=0.2)
     parser.add_argument("--min-correction-len", type=int, default=1)
+    parser.add_argument("--correction-target-primitive-len", type=int, default=DEFAULT_CORRECTION_TARGET_PRIMITIVE_LEN)
+    parser.add_argument("--keep-correction-terminal-stop", action="store_true")
     parser.add_argument("--seed", type=int, default=41)
     args = parser.parse_args()
     if args.max_abs_step_diff < 0:
@@ -390,6 +458,8 @@ def parse_args():
         parser.error("--max-step-diff-ratio must be >= 0")
     if args.min_correction_len < 1:
         parser.error("--min-correction-len must be >= 1")
+    if args.correction_target_primitive_len < 1:
+        parser.error("--correction-target-primitive-len must be >= 1")
     return args
 
 
@@ -406,6 +476,8 @@ def main():
         max_abs_step_diff=args.max_abs_step_diff,
         max_step_diff_ratio=args.max_step_diff_ratio,
         min_correction_len=args.min_correction_len,
+        correction_target_primitive_len=args.correction_target_primitive_len,
+        drop_correction_terminal_stop=not args.keep_correction_terminal_stop,
     )
 
 
