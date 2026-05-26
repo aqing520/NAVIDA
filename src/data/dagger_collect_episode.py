@@ -738,11 +738,6 @@ class EpisodeCollector:
                 last_navigation = f"expert rescue: {self.agent.action_id_to_str(action)}"
                 current_action_is_rescue = True
 
-            if action == 0 and not force_episode_end:
-                action = self.get_oracle_action(expert, ref_path, next_waypoint_id)
-                source = "expert"
-                last_navigation = f"expert continue: {self.agent.action_id_to_str(action)}"
-
             debug_frames.append(
                 make_debug_frame(
                     np.array(current_rgb),
@@ -781,8 +776,8 @@ class EpisodeCollector:
         kept_reason = ""
         terminal_stop = bool(actions) and actions[-1] == 0
         kept = terminal_stop and metrics["distance_to_goal"] < MIDGOAL_RADIUS and (
-            ((rescued and relative_pl < RELATIVE_PATH_LENGTH_THRESHOLD))
-            or (relative_pl < SUCCESS_RELATIVE_PATH_LENGTH_THRESHOLD)
+            ((rescued and relative_pl > RELATIVE_PATH_LENGTH_THRESHOLD))
+            or ((not rescued) and relative_pl > SUCCESS_RELATIVE_PATH_LENGTH_THRESHOLD)
         )
         if kept:
             if rescue_tier == "clean":

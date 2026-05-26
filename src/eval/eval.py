@@ -11,7 +11,7 @@ import cv2
 import imageio
 from habitat.utils.visualizations import maps
 import random
-from transformers import Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration, AutoProcessor, GenerationConfig
+from transformers import AutoModelForImageTextToText, AutoProcessor, GenerationConfig
 import argparse, habitat
 from habitat_extensions import measures, task
 from habitat_baselines.config.default import get_config
@@ -173,10 +173,9 @@ class NaVIDA_Agent(Agent):
 
         model_init_kwargs = {}
         model_init_kwargs["attn_implementation"] = "flash_attention_2"
-        model_init_kwargs["use_cache"] = True
-        model_init_kwargs['torch_dtype'] = torch.bfloat16
+        model_init_kwargs["torch_dtype"] = torch.bfloat16
 
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, **model_init_kwargs)
+        self.model = AutoModelForImageTextToText.from_pretrained(model_path, **model_init_kwargs)
 
         if lora_path is not None and lora_path!= '':
             print('Loading LoRA weights...')
