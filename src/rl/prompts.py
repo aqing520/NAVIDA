@@ -23,6 +23,30 @@ RL_PROMPT_TEMPLATE = (
     "turn left 15 degree, turn right 15 degree."
 )
 
+STOP_HINT_PROMPT_TEMPLATE = BASE_PROMPT_TEMPLATE + " You may answer stop when the goal has been reached."
+
+SR_STOP_PROMPT_TEMPLATE = (
+    "Imagine you are a robot programmed for navigation tasks. "
+    "You have been given a video of historical observations and an image of the current observation. "
+    "Your assigned task is: '{}'. Analyze this series of images to decide your next move. "
+    "Available actions are: stop; move forward by a distance in cm; turn left by degrees; turn right by degrees. "
+    "If the current view already satisfies the destination description or reaches the final landmark, choose stop instead of moving on. "
+    "Otherwise choose the safest next one or two actions that continue following the instruction. "
+    "Respond only with comma-separated actions in these formats: stop, forward <number> cm, turn left <number> degree, turn right <number> degree."
+)
+
+
+def get_prompt_template(prompt_style: str) -> str:
+    if prompt_style == "baseline":
+        return BASE_PROMPT_TEMPLATE
+    if prompt_style == "stop_hint":
+        return STOP_HINT_PROMPT_TEMPLATE
+    if prompt_style == "sr_stop":
+        return SR_STOP_PROMPT_TEMPLATE
+    if prompt_style == "rl":
+        return RL_PROMPT_TEMPLATE
+    raise ValueError(f"Unsupported prompt style: {prompt_style}")
+
 
 def encode_image_base64(image: Image.Image) -> str:
     buffer = io.BytesIO()

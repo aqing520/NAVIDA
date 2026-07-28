@@ -90,7 +90,7 @@ def str2bool(v):
 
 def evaluate_agent(config, split_id, dataset, model_path, lora_path, result_path, num_generations,
                     forward_distance, turn_angle, max_action_history, resolution_ratio, prompt_style,
-                    temperature, max_episodes) -> None:
+                    temperature, max_episodes, require_map) -> None:
  
     env = Env(config.habitat, dataset)
 
@@ -103,7 +103,8 @@ def evaluate_agent(config, split_id, dataset, model_path, lora_path, result_path
                         resolution_ratio, 
                         num_generations,
                         prompt_style,
-                        temperature)
+                        temperature,
+                        require_map=require_map)
 
     num_episodes = len(env.episodes)
     if max_episodes is not None:
@@ -464,6 +465,8 @@ def main():
                         help="sampling temperature for local generation")
     parser.add_argument("--max-episodes", type=int, default=None,
                         help="optional maximum number of episodes to evaluate in this split")
+    parser.add_argument("--require-map", type=str2bool, default=True,
+                        help="whether to save top-down map GIF visualizations")
     args = parser.parse_args()
 
     config = get_config(args.exp_config)
@@ -496,7 +499,8 @@ def main():
 
     evaluate_agent(config, args.split_id, dataset_split, args.model_path, args.lora_path, args.result_path,
                 args.num_generations, args.forward_distance, args.turn_angle, args.max_action_history,
-                args.resolution_ratio, args.prompt_style, args.temperature, args.max_episodes)
+                args.resolution_ratio, args.prompt_style, args.temperature, args.max_episodes,
+                args.require_map)
 
 if __name__ == "__main__":
     main()

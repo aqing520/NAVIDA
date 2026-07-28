@@ -1,4 +1,6 @@
 import argparse
+from datetime import datetime
+from datetime import timedelta
 import json
 import os
 import random
@@ -7,8 +9,10 @@ from typing import Iterable, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from peft import PeftModel
+from torch.nn.parallel import DistributedDataParallel as DDP
+from peft import LoraConfig, PeftModel, get_peft_model
 from qwen_vl_utils import process_vision_info
 from transformers import AutoModelForImageTextToText, AutoProcessor, GenerationConfig
 
@@ -25,6 +29,41 @@ def seed_all(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def init_distributed(args) -> tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    device_index = 0
+    if distributed:
+        visible_gpu_count = torch.cuda.device_count()
+        if visible_gpu_count == 0:
+            raise RuntimeError("Distributed RL training requires at least one visible CUDA device")
+        if local_rank >= visible_gpu_count:
+            raise RuntimeError(
+                "NCCL DDP requires at most one rank per visible GPU. "
+                f"Got LOCAL_RANK={local_rank} with {visible_gpu_count} visible GPUs."
+            )
+        device_index = local_rank
+        torch.cuda.set_device(device_index)
+        args.device = f"cuda:{device_index}"
+        dist.init_process_group(backend="nccl", timeout=timedelta(seconds=args.ddp_timeout_seconds))
+    return distributed, rank, local_rank, world_size, device_index
+
+
+def cleanup_distributed(distributed: bool) -> None:
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
 def load_model_and_processor(args):
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_path,
@@ -33,6 +72,16 @@ def load_model_and_processor(args):
     )
     if args.lora_path:
         model = PeftModel.from_pretrained(model, args.lora_path, is_trainable=True)
+    elif args.use_lora:
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=[item.strip() for item in args.lora_target_modules.split(",") if item.strip()],
+        )
+        model = get_peft_model(model, lora_config)
     model = model.to(args.device)
     model.accepts_loss_kwargs = False
 
@@ -56,6 +105,8 @@ def load_model_and_processor(args):
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
+    if hasattr(model, "print_trainable_parameters") and int(os.environ.get("RANK", "0")) == 0:
+        model.print_trainable_parameters()
     return model, processor
 
 
@@ -66,7 +117,7 @@ def build_generation_config(args) -> GenerationConfig:
         top_p=args.top_p,
         max_new_tokens=args.max_new_tokens,
         num_return_sequences=1,
-        use_cache=not args.gradient_checkpointing,
+        use_cache=True,
         repetition_penalty=args.repetition_penalty,
     )
 
@@ -78,7 +129,8 @@ def step_logprob_loss(
     advantage: float,
     ignore_token_ids: set[int],
     device: str,
-) -> tuple[torch.Tensor, int, float]:
+    kl_beta: float = 0.0,
+) -> tuple[torch.Tensor, int, float, float]:
     prompt_text = _apply_chat_template(processor, step.prompt_messages, add_generation_prompt=True)
     full_messages = step.prompt_messages + [
         {"role": "assistant", "content": [{"type": "text", "text": step.response_text}]}
@@ -102,14 +154,58 @@ def step_logprob_loss(
     shifted_labels = labels[:, 1:]
     valid_mask = shifted_labels != -100
     if valid_mask.sum().item() == 0:
-        return logits.sum() * 0.0, 0, 0.0
+        return logits.sum() * 0.0, 0, 0.0, 0.0
 
     safe_labels = shifted_labels.masked_fill(~valid_mask, 0)
     token_logprobs = F.log_softmax(logits, dim=-1).gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
-    mean_logprob = token_logprobs.masked_select(valid_mask).mean()
+    response_logprobs = token_logprobs.masked_select(valid_mask)
+    mean_logprob = response_logprobs.mean()
+
+    kl_loss = mean_logprob.new_tensor(0.0)
+    if kl_beta > 0:
+        ref_token_logprobs = reference_token_logprobs(model, batch, safe_labels, valid_mask)
+        ref_response_logprobs = ref_token_logprobs.masked_select(valid_mask)
+        log_ratio = ref_response_logprobs - response_logprobs
+        kl_loss = (log_ratio.exp() - log_ratio - 1.0).mean()
+
     adv = torch.tensor(float(advantage), dtype=mean_logprob.dtype, device=mean_logprob.device)
-    loss = -adv * mean_logprob
-    return loss, int(valid_mask.sum().item()), float(mean_logprob.detach().float().cpu())
+    loss = -adv * mean_logprob + float(kl_beta) * kl_loss
+    return (
+        loss,
+        int(valid_mask.sum().item()),
+        float(mean_logprob.detach().float().cpu()),
+        float(kl_loss.detach().float().cpu()),
+    )
+
+
+def reference_token_logprobs(model, batch: dict, safe_labels: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    base_model = unwrap_model(model)
+    adapter_context = disable_adapter_context(base_model)
+    with torch.no_grad(), adapter_context:
+        ref_outputs = base_model(**batch)
+        ref_logits = ref_outputs.logits[:, :-1, :]
+        return F.log_softmax(ref_logits, dim=-1).gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+
+
+def disable_adapter_context(model):
+    model = unwrap_model(model)
+    if hasattr(model, "disable_adapter"):
+        return model.disable_adapter()
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None and hasattr(base_model, "disable_adapter"):
+        return base_model.disable_adapter()
+    raise ValueError("--kl-beta > 0 currently requires a PEFT LoRA model so adapters can be disabled for the reference policy")
+
+
+def zero_trainable_loss(model) -> torch.Tensor:
+    zero = None
+    for param in model.parameters():
+        if param.requires_grad:
+            term = param.sum() * 0.0
+            zero = term if zero is None else zero + term
+    if zero is None:
+        raise ValueError("No trainable parameters found")
+    return zero
 
 
 def normalize_group_returns(rollouts: list[EpisodeRollout], eps: float = 1e-6) -> list[float]:
@@ -123,16 +219,80 @@ def normalize_group_returns(rollouts: list[EpisodeRollout], eps: float = 1e-6) -
     return [float((value - mean) / (std + eps)) for value in returns]
 
 
+def distributed_min_int(value: int, device: str) -> int:
+    tensor = torch.tensor([int(value)], device=device, dtype=torch.long)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+    return int(tensor.item())
+
+
+def resolve_run_layout(args) -> tuple[str, str, str]:
+    if args.run_name:
+        run_name = args.run_name
+    elif args.output_dir:
+        run_name = os.path.basename(os.path.normpath(args.output_dir))
+    else:
+        run_name = datetime.now().strftime("rl_%Y%m%d_%H%M%S")
+
+    output_dir = None
+    if args.output_dir:
+        output_dir = os.path.normpath(args.output_dir)
+    result_dir = os.path.normpath(args.result_dir)
+
+    if output_dir and (output_dir == result_dir or output_dir.startswith(result_dir + os.sep)):
+        checkpoint_dir = output_dir
+    else:
+        checkpoint_dir = os.path.join(result_dir, run_name)
+
+    log_path = os.path.join(args.log_dir, f"{run_name}.jsonl")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+    return run_name, checkpoint_dir, log_path
+
+
 def train(args) -> None:
-    seed_all(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
+    distributed, rank, local_rank, world_size, device_index = init_distributed(args)
+    seed_all(args.seed + rank)
+    run_name, checkpoint_dir, log_path = resolve_run_layout(args)
+    if distributed:
+        root, ext = os.path.splitext(log_path)
+        log_path = f"{root}.rank{rank}{ext}"
+    if is_main_process(rank):
+        print(
+            json.dumps(
+                {
+                    "event": "rl_run_layout",
+                    "run_name": run_name,
+                    "checkpoint_dir": checkpoint_dir,
+                    "log_path": log_path,
+                    "world_size": world_size,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    print(
+        json.dumps(
+            {
+                "event": "rl_rank_start",
+                "rank": rank,
+                "local_rank": local_rank,
+                "device_index": device_index,
+                "device": args.device,
+                "log_path": log_path,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     model, processor = load_model_and_processor(args)
+    if distributed:
+        model = DDP(model, device_ids=[device_index], output_device=device_index, find_unused_parameters=True)
     optimizer = torch.optim.AdamW(
         [param for param in model.parameters() if param.requires_grad],
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    ignore_token_ids = collect_ignore_label_token_ids(processor, model.config)
+    ignore_token_ids = collect_ignore_label_token_ids(processor, unwrap_model(model).config)
     reward_config = RewardConfig(
         distance_delta_scale=args.distance_delta_scale,
         success_bonus=args.success_bonus,
@@ -154,50 +314,70 @@ def train(args) -> None:
         max_steps=args.max_steps,
     )
     generation_config = build_generation_config(args)
-    log_path = os.path.join(args.output_dir, "rl_train_log.jsonl")
     episode_indices = list(range(runner.num_episodes))
     if args.max_episodes is not None:
         episode_indices = episode_indices[: args.max_episodes]
 
     try:
         global_step = 0
+        last_regular_save_step = 0
         for epoch in range(args.num_epochs):
             random.shuffle(episode_indices)
-            for episode_index in episode_indices:
-                model.eval()
+            if distributed:
+                usable = (len(episode_indices) // world_size) * world_size
+                local_episode_indices = episode_indices[:usable][rank::world_size]
+            else:
+                local_episode_indices = episode_indices
+            for local_episode_pos, episode_index in enumerate(local_episode_indices):
+                rollout_model = unwrap_model(model)
+                rollout_model.eval()
                 rollouts = [
-                    runner.rollout_episode(model, episode_index, generation_config, args.device)
+                    runner.rollout_episode(rollout_model, episode_index, generation_config, args.device)
                     for _ in range(args.group_size)
                 ]
+                if distributed:
+                    dist.barrier()
                 advantages = normalize_group_returns(rollouts)
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
                 losses = []
                 num_tokens = 0
                 logprobs = []
-                for rollout, advantage in zip(rollouts, advantages):
-                    for step in rollout.steps:
-                        loss, valid_tokens, mean_logprob = step_logprob_loss(
-                            model=model,
-                            processor=processor,
-                            step=step,
-                            advantage=advantage,
-                            ignore_token_ids=ignore_token_ids,
-                            device=args.device,
-                        )
-                        if valid_tokens == 0:
-                            continue
-                        (loss / args.gradient_accumulation_steps).backward()
+                kl_values = []
+                rollout_steps = [
+                    (step, advantage)
+                    for rollout, advantage in zip(rollouts, advantages)
+                    for step in rollout.steps
+                ]
+                max_backward_steps = len(rollout_steps)
+                if distributed:
+                    max_backward_steps = distributed_min_int(max_backward_steps, args.device)
+                for backward_idx in range(max_backward_steps):
+                    step, advantage = rollout_steps[backward_idx]
+                    loss, valid_tokens, mean_logprob, kl_value = step_logprob_loss(
+                        model=model,
+                        processor=processor,
+                        step=step,
+                        advantage=advantage,
+                        ignore_token_ids=ignore_token_ids,
+                        device=args.device,
+                        kl_beta=args.kl_beta,
+                    )
+                    if valid_tokens == 0:
+                        loss = zero_trainable_loss(model)
+                    else:
                         losses.append(float(loss.detach().float().cpu()))
                         num_tokens += valid_tokens
                         logprobs.append(mean_logprob)
-                        if len(losses) % args.gradient_accumulation_steps == 0:
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                            optimizer.step()
-                            optimizer.zero_grad(set_to_none=True)
-                            global_step += 1
+                        kl_values.append(kl_value)
+                    (loss / args.gradient_accumulation_steps).backward()
+                    if (backward_idx + 1) % args.gradient_accumulation_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        global_step += 1
 
-                if losses and len(losses) % args.gradient_accumulation_steps != 0:
+                if max_backward_steps % args.gradient_accumulation_steps != 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -205,7 +385,10 @@ def train(args) -> None:
 
                 log_row = {
                     "global_step": global_step,
+                    "rank": rank,
+                    "world_size": world_size,
                     "epoch": epoch,
+                    "local_episode_pos": local_episode_pos,
                     "episode_index": episode_index,
                     "episode_id": rollouts[0].episode_id if rollouts else None,
                     "group_returns": [rollout.total_reward for rollout in rollouts],
@@ -213,22 +396,39 @@ def train(args) -> None:
                     "success": [rollout.success for rollout in rollouts],
                     "spl": [rollout.spl for rollout in rollouts],
                     "distance_to_goal": [rollout.distance_to_goal for rollout in rollouts],
-                    "num_steps": [len(rollout.steps) for rollout in rollouts],
+                    "num_steps": [rollout.primitive_steps for rollout in rollouts],
+                    "num_blocks": [len(rollout.steps) for rollout in rollouts],
                     "loss_mean": float(np.mean(losses)) if losses else 0.0,
                     "mean_logprob": float(np.mean(logprobs)) if logprobs else 0.0,
+                    "kl_mean": float(np.mean(kl_values)) if kl_values else 0.0,
+                    "kl_beta": args.kl_beta,
                     "num_tokens": num_tokens,
                 }
                 append_jsonl(log_path, log_row)
                 print(json.dumps(log_row, ensure_ascii=False), flush=True)
 
-                if global_step > 0 and global_step % args.save_steps == 0:
-                    save_checkpoint(model, processor, args.output_dir, global_step)
+                regular_save_due = (
+                    args.save_steps > 0
+                    and global_step > 0
+                    and global_step // args.save_steps > last_regular_save_step // args.save_steps
+                )
+                if regular_save_due:
+                    if is_main_process(rank):
+                        save_checkpoint(model, processor, checkpoint_dir, global_step)
+                    last_regular_save_step = global_step
+                if distributed:
+                    dist.barrier()
                 if args.max_updates is not None and global_step >= args.max_updates:
-                    save_checkpoint(model, processor, args.output_dir, global_step)
+                    if is_main_process(rank):
+                        save_checkpoint(model, processor, checkpoint_dir, global_step)
+                    if distributed:
+                        dist.barrier()
                     return
-        save_checkpoint(model, processor, args.output_dir, global_step)
+        if is_main_process(rank):
+            save_checkpoint(model, processor, checkpoint_dir, global_step)
     finally:
         runner.close()
+        cleanup_distributed(distributed)
 
 
 def append_jsonl(path: str, row: dict) -> None:
@@ -239,7 +439,7 @@ def append_jsonl(path: str, row: dict) -> None:
 def save_checkpoint(model, processor, output_dir: str, step: int) -> None:
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(ckpt_dir, exist_ok=True)
-    model.save_pretrained(ckpt_dir)
+    unwrap_model(model).save_pretrained(ckpt_dir)
     processor.save_pretrained(ckpt_dir)
 
 
@@ -248,7 +448,18 @@ def parse_args():
     parser.add_argument("--exp-config", default="config/vln_r2r_train.yaml")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--lora-path", default=None)
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--use-lora", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora-target-modules",
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    )
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--result-dir", default="result/rl")
+    parser.add_argument("--log-dir", default="result/log")
+    parser.add_argument("--run-name", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-dtype", default="bfloat16", choices=["auto", "bfloat16", "float16", "float32"])
     parser.add_argument("--attn-implementation", default="flash_attention_2")
@@ -259,9 +470,11 @@ def parse_args():
     parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--kl-beta", type=float, default=0.0)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument("--ddp-timeout-seconds", type=int, default=7200)
     parser.add_argument("--freeze-vision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--freeze-linear-attention", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
